@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: spark-attic
+Version: 0.1.0
+Summary: Borrow a GB10's display carveout from atticd as CUDA device memory
+Requires-Python: >=3.9
+License-Expression: MIT OR Apache-2.0

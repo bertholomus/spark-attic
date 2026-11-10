@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright 2026 bertholomus
+# spark-attic: lends the GB10 display carveout to CUDA programs (atticd). See README.md and INSTALL.md.
+[Unit]
+Description=spark-attic display-carveout lender (atticd)
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/atticd --socket /run/spark-attic/attic.sock --key-file /etc/spark-attic/key --mode heap
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=spark-attic
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

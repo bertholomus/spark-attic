@@ -1,0 +1,5 @@
+[vllm.general_plugins]
+spark_attic = spark_attic.vllm_plugin:register
+
+[sglang.srt.plugins]
+spark_attic = spark_attic.sglang_plugin:register
