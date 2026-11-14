@@ -28,7 +28,7 @@ set -uo pipefail
 
 NAME=spark-attic
 HERE=$(cd "$(dirname "$0")" && pwd)
-VERSION=${INSTALL_VERSION:-0.1.0}   # build-release.sh stamps the release version here
+VERSION=${INSTALL_VERSION:-0.1.1}   # build-release.sh stamps the release version here
 URL_BASE=${ATTIC_URL_BASE:-https://github.com/bertholomus/spark-attic/releases/download}
 SYSCTL_NAME=99-spark-attic-minfree.conf
 CHECK=0; JSON=0; PLAIN=0; WITH_SYSCTL=0; NO_SYSCTL=0; DEMO=0; FAIL_STEP=""
@@ -36,35 +36,69 @@ FROM=""; WANT_VERSION=""; ROOT=""; ART=""
 ESC=$'\033'
 
 say() { printf 'install.sh: %s\n' "$*" >&2; }
-die_usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+die_usage() {
+  if [ -r "$0" ]; then
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2
+  else
+    # piped (curl | bash) there is no file behind $0: the same lines, kept in step with the header above
+    cat >&2 <<'USAGE'
+SPDX-License-Identifier: MIT OR Apache-2.0
+Copyright 2026 bertholomus
+install.sh: spark-attic on a GB10 node, one command. Also safe as
+  curl -fsSL <release url>/install.sh | sudo bash
+Preflight (read-only, each failure one sentence with what to do), fetch the artifact for the
+version (--from DIR|TARBALL for an offline copy) and verify it against SHA256SUMS, install the
+files, make the key root-only when none exists (never overwrite a key), install the unit, run
+attic-validate.sh for the running driver, enable and start attic.service only if validate
+passed, then read the status file and print the result. A second run on an installed node
+changes nothing, or upgrades in place when the artifact is newer. Any failure after the first
+write rolls back what this run changed and says what it rolled back. Every step is logged to
+/var/log/spark-attic/install.log (--check writes nothing anywhere).
+  --check            run only the preflight and change nothing (exit 0 clean, 1 problems)
+  --format json      with --check: one JSON object per check, for spark-attic doctor
+  --from DIR|TGZ     install from an unpacked artifact or a release tarball (default: fetch
+                     the release for --version from --url)
+  --version V        the artifact version (default the stamped INSTALL_VERSION)
+  --url BASE         where releases live (default the bertholomus release bucket below)
+  --with-sysctl      install the optional vm.min_free_kbytes drop-in (the default leaves it out)
+  --no-sysctl        accepted and ignored: no drop-in is the default
+  --root DIR         install under DIR instead of / (the host tests)
+USAGE
+  fi
+  exit 2
+}
 
 # ---------------------------------------------------------------- colour and the header
 # The Bertholomus colours (the website icon kit): the frames take the paper colour, the L nose
 # the gold-on-dark one, on the terminal's own background. Colour only on a colour TTY.
-COLOUR=0; TRUECOLOR=0
-if [ "$PLAIN" = 0 ] && [ -z "${NO_COLOR:-}" ] && [ "${ATTIC_COLOR:-auto}" != never ]; then
-  case "${ATTIC_COLOR:-auto}" in
-    always) COLOUR=1 ;;
-    auto) [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != dumb ] && COLOUR=1 ;;
-  esac
-fi
-if [ "$COLOUR" = 1 ]; then
-  case "${TERM:-}" in *direct*) TRUECOLOR=1 ;; esac
-  [ -n "${COLORTERM:-}" ] && TRUECOLOR=1
-fi
-if [ "$COLOUR" = 1 ]; then
-  # The icon kit's terminal colours: paper #f3f2f2, the L's gold #e1ad66.
-  if [ "$TRUECOLOR" = 1 ]; then
-    C_PAPER="$ESC[38;2;243;242;242m"; C_GOLD="$ESC[38;2;225;173;102m"
-    C_PAPER_BOLD="$ESC[1;38;2;243;242;242m"; C_GOLD_BOLD="$ESC[1;38;2;225;173;102m"
-  else
-    C_PAPER="$ESC[38;5;255m"; C_GOLD="$ESC[38;5;179m"
-    C_PAPER_BOLD="$ESC[1;38;5;255m"; C_GOLD_BOLD="$ESC[1;38;5;179m"
+# The colours are picked after main() has parsed the arguments: --plain must win over
+# ATTIC_COLOR=always, and a colour decision made at load time would run before the parse.
+pick_colours() {
+  COLOUR=0; TRUECOLOR=0
+  if [ "$PLAIN" = 0 ] && [ -z "${NO_COLOR:-}" ] && [ "${ATTIC_COLOR:-auto}" != never ]; then
+    case "${ATTIC_COLOR:-auto}" in
+      always) COLOUR=1 ;;
+      auto) [ -t 1 ] && [ -n "${TERM:-}" ] && [ "$TERM" != dumb ] && COLOUR=1 ;;
+    esac
   fi
-  C_RESET="$ESC[0m"
-else
-  C_PAPER=""; C_GOLD=""; C_PAPER_BOLD=""; C_GOLD_BOLD=""; C_RESET=""
-fi
+  if [ "$COLOUR" = 1 ]; then
+    case "${TERM:-}" in *direct*) TRUECOLOR=1 ;; esac
+    [ -n "${COLORTERM:-}" ] && TRUECOLOR=1
+  fi
+  if [ "$COLOUR" = 1 ]; then
+    # The icon kit's terminal colours: paper #f3f2f2, the L's gold #e1ad66.
+    if [ "$TRUECOLOR" = 1 ]; then
+      C_PAPER="$ESC[38;2;243;242;242m"; C_GOLD="$ESC[38;2;225;173;102m"
+      C_PAPER_BOLD="$ESC[1;38;2;243;242;242m"; C_GOLD_BOLD="$ESC[1;38;2;225;173;102m"
+    else
+      C_PAPER="$ESC[38;5;255m"; C_GOLD="$ESC[38;5;179m"
+      C_PAPER_BOLD="$ESC[1;38;5;255m"; C_GOLD_BOLD="$ESC[1;38;5;179m"
+    fi
+    C_RESET="$ESC[0m"
+  else
+    C_PAPER=""; C_GOLD=""; C_PAPER_BOLD=""; C_GOLD_BOLD=""; C_RESET=""
+  fi
+}
 
 share_dir() {
   if [ -n "${ATTIC_SHARE_DIR:-}" ]; then printf '%s' "$ATTIC_SHARE_DIR"; return; fi
@@ -118,17 +152,29 @@ render_header() {
 }
 
 step_start() {
-  printf '  %s·%s %s\n' "$C_PAPER" "$C_RESET" "$1"
+  if [ -n "$C_PAPER" ]; then
+    printf '  %s·%s %s\n' "$C_PAPER" "$C_RESET" "$1"
+  else
+    printf '  -> %s\n' "$1"
+  fi
   [ "$DEMO" = 1 ] && sleep "$DEMO_PACE"
   return 0
 }
 step_done() {
-  printf '    %s✓%s %s%s\n' "$C_GOLD" "$C_RESET" "$1" "${2:+ ($2)}"
+  if [ -n "$C_GOLD" ]; then
+    printf '    %s✓%s %s%s\n' "$C_GOLD" "$C_RESET" "$1" "${2:+ ($2)}"
+  else
+    printf '    ok  %s%s\n' "$1" "${2:+ ($2)}"
+  fi
   [ "$DEMO" = 1 ] && sleep "$DEMO_PACE"
   return 0
 }
 step_fail() {
-  printf '    %s✗%s %s — %s\n' "$C_PAPER_BOLD" "$C_RESET" "$1" "$2"
+  if [ -n "$C_PAPER_BOLD" ]; then
+    printf '    %s✗%s %s — %s\n' "$C_PAPER_BOLD" "$C_RESET" "$1" "$2"
+  else
+    printf '    FAIL %s: %s\n' "$1" "$2"
+  fi
   [ -n "${3:-}" ] && printf '        %s\n' "$3"
   return 0
 }
@@ -156,11 +202,19 @@ pre_record() { # id state what [fix]
   if [ "$JSON" = 1 ]; then
     printf '{"id":"%s","state":"%s","what":"%s","fix":"%s"}\n' "$1" "$2" "$3" "${4:-}"
   elif [ "$2" = pass ]; then
-    printf '  %s✓%s %s\n' "$C_GOLD" "$C_RESET" "$3"
+    if [ -n "$C_GOLD" ]; then
+      printf '  %s✓%s %s\n' "$C_GOLD" "$C_RESET" "$3"
+    else
+      printf '  ok  %s\n' "$3"
+    fi
   elif [ "$2" = warn ]; then
     printf '  ~ %s (fix when you can: %s)\n' "$3" "${4:-see INSTALL.md}"
   else
-    printf '  %s✗%s %s\n        %s\n' "$C_PAPER_BOLD" "$C_RESET" "$3" "${4:-}"
+    if [ -n "$C_PAPER_BOLD" ]; then
+      printf '  %s✗%s %s\n        %s\n' "$C_PAPER_BOLD" "$C_RESET" "$3" "${4:-}"
+    else
+      printf '  FAIL %s\n        %s\n' "$3" "${4:-}"
+    fi
   fi
   return 0
 }
@@ -205,6 +259,26 @@ preflight_run() {
   else
     pre_record root fail "install.sh must run as root (atticd needs root for the driver)" \
       "re-run with sudo, or curl -fsSL <url>/install.sh | sudo bash"
+    problems=$((problems + 1))
+  fi
+  # attic-check and the daemon link the driver's libcuda.so.1: name it when it is missing, instead of
+  # the modes failing one by one ("failed on every mode" says nothing). The host test's fake node
+  # carries no driver library, so ATTIC_TEST skips the lookup; ATTIC_LIBCUDA=present|absent fakes it.
+  if [ -n "${ATTIC_LIBCUDA:-}" ]; then
+    if [ "$ATTIC_LIBCUDA" = present ]; then
+      pre_record libcuda pass "the driver library is there (libcuda.so.1)"
+    else
+      pre_record libcuda fail "no libcuda.so.1 on this host: attic-check and the daemon cannot load the NVIDIA driver" \
+        "install the NVIDIA driver package (it provides libcuda.so.1) and re-run install.sh"
+      problems=$((problems + 1))
+    fi
+  elif [ "${ATTIC_TEST:-0}" = 1 ]; then
+    pre_record libcuda pass "the host test's fake node: no driver library expected here"
+  elif ldconfig -p 2>/dev/null | grep -q "libcuda\.so\.1"; then
+    pre_record libcuda pass "the driver library is there (libcuda.so.1)"
+  else
+    pre_record libcuda fail "no libcuda.so.1 on this host: attic-check and the daemon cannot load the NVIDIA driver" \
+      "install the NVIDIA driver package (it provides libcuda.so.1) and re-run install.sh"
     problems=$((problems + 1))
   fi
   if [ -d "$ROOT/run/systemd/system" ]; then
@@ -272,7 +346,7 @@ preflight_run() {
     ''|*[!0-9]*) pre_record disk warn "could not read free space at $df_target" ;;
     *)
       if [ "$avail_kb" -lt 65536 ]; then
-        pre_record disk fail "only $((avail_kb / 1024)) MiB free at $df_target: spark-attic needs about 10 MiB" \
+        pre_record disk fail "only $((avail_kb / 1024)) MiB free at $df_target: spark-attic needs 64 MiB" \
           "free some space, then re-run"
         problems=$((problems + 1))
       else
@@ -392,6 +466,12 @@ BACKUP_TARGETS="/usr/local/sbin/atticd /usr/local/sbin/attic-check /usr/local/bi
 /var/lib/attic
 /etc/sysctl.d/$SYSCTL_NAME"
 
+cleanup_tmp() { # a finished or failed install leaves no temp dirs: the fetched artifact, the backup, the demo root
+  [ -n "${tmpfetch:-}" ] && rm -rf -- "$tmpfetch"
+  [ -n "${BK:-}" ] && rm -rf -- "$BK"
+  [ -n "${DEMO_ROOT:-}" ] && rm -rf -- "$DEMO_ROOT"
+}
+
 backup_all() { # snapshot what exists now; the journal drives the rollback
   BK=$(mktemp -d)
   : >"$BK/journal"
@@ -475,12 +555,18 @@ install_files() {
   install -m 755 "$ART/bin/atticd" "$R/usr/local/sbin/atticd" || return 1
   install -m 755 "$ART/bin/attic-check" "$R/usr/local/sbin/attic-check" || return 1
   install -m 755 "$ART/bin/spark-attic" "$R/usr/local/bin/$NAME" || return 1
+  # the manual path this tree described before 0.1.1 put attic-check in /usr/local/bin; remove
+  # that stale copy so the sbin one is the only attic-check on the node
+  if [ -e "$R/usr/local/bin/attic-check" ]; then
+    rm -f "$R/usr/local/bin/attic-check"
+    log "removed an old attic-check from /usr/local/bin (the manual path now matches the installer)"
+  fi
   for f in header-art.txt header-col.txt README.md INSTALL.md STATUS-FILE.md \
-           RELEASE-NOTES-0.1.0.md THIRD_PARTY_NOTICES LICENSE-MIT LICENSE-APACHE; do
+           RELEASE-NOTES-0.1.1.md THIRD_PARTY_NOTICES LICENSE-MIT LICENSE-APACHE; do
     # the art files are optional (the release's art gate may leave them out); the rest are not
     [ -f "$ART/$(art_share)/$f" ] && install -m 644 "$ART/$(art_share)/$f" "$R/usr/local/share/$NAME/$f"
   done
-  for f in README.md INSTALL.md STATUS-FILE.md RELEASE-NOTES-0.1.0.md \
+  for f in README.md INSTALL.md STATUS-FILE.md RELEASE-NOTES-0.1.1.md \
            THIRD_PARTY_NOTICES LICENSE-MIT LICENSE-APACHE; do
     [ -f "$R/usr/local/share/$NAME/$f" ] ||
       { say "the artifact is missing share/$f: refusing"; return 1; }
@@ -530,9 +616,9 @@ wait_status() { # wait for a fresh status file; nothing printed, 0 when one is t
 
 next_steps() {
   local py="/usr/local/share/$NAME/python"
-  printf '      next: vLLM — put %s on PYTHONPATH, mount /run/spark-attic and the key (INSTALL.md, Engines)\n' "$py"
-  printf '      next: SGLang — the same mount and PYTHONPATH (INSTALL.md, Engines)\n'
-  printf '      next: TensorFold — TF_CUDA_CARVEOUT_SOURCE=attic and the key (INSTALL.md, Engines)\n'
+  printf '      next: vLLM: put %s on PYTHONPATH, mount /run/spark-attic and the key (INSTALL.md, Engines)\n' "$py"
+  printf '      next: SGLang: the same mount and PYTHONPATH (INSTALL.md, Engines)\n'
+  printf '      next: TensorFold: TF_CUDA_CARVEOUT_SOURCE=attic and the key (INSTALL.md, Engines)\n'
 }
 
 # ---------------------------------------------------------------- demo mode
@@ -574,7 +660,7 @@ case "\$1 \$2" in
   "start attic.service"|"enable --now"*)
     echo enabled >"\$S/enabled"; echo active >"\$S/active"
     mkdir -p "$r/run/spark-attic"
-    printf '{"name":"spark-attic","version":"0.1.0","state":"ready","why":"","driver":"580.178.04","mode":"heap","validated":true,"validated_at":"%s","size_mib":2044,"free_mib":0,"largest_mib":0,"lent_mib":2044,"draining_mib":0,"clients":1,"every_s":10,"pid":1,"updated":%s}\n' \
+    printf '{"name":"spark-attic","version":"${VERSION}","state":"ready","why":"","driver":"580.178.04","mode":"heap","validated":true,"validated_at":"%s","size_mib":2044,"free_mib":0,"largest_mib":0,"lent_mib":2044,"draining_mib":0,"clients":1,"every_s":10,"pid":1,"updated":%s}\n' \
       "\$(date -u +%FT%TZ)" "\$(date +%s)" >"$r/run/spark-attic/status.json"
     exit 0 ;;
   "enable attic.service") echo enabled >"\$S/enabled"; exit 0 ;;
@@ -622,7 +708,7 @@ FAKE
   [ -f "$HERE/share/$NAME/header-art.txt" ] &&
     cp "$HERE/share/$NAME/header-art.txt" "$HERE/share/$NAME/header-col.txt" "$A/share/"
   # the docs: the working tree keeps them under release/, the exported tree at its root
-  for doc in README.md INSTALL.md RELEASE-NOTES-0.1.0.md; do
+  for doc in README.md INSTALL.md RELEASE-NOTES-0.1.1.md; do
     [ -f "$HERE/release/$doc" ] && cp "$HERE/release/$doc" "$A/share/"
     [ -f "$HERE/$doc" ] && cp "$HERE/$doc" "$A/share/"
   done
@@ -656,12 +742,13 @@ FAKE
 }
 
 demo_run() {
-  COLOUR=1; PLAIN=0
-  # the demo's colours are always on (it is made to be watched); --plain turns them off
-  [ "$PLAIN" = 0 ] && [ -z "${NO_COLOR:-}" ] && { COLOUR=1; TRUECOLOR=0; }
-  if [ "$COLOUR" = 1 ] && [ -z "$C_RESET" ]; then
-    C_PAPER="$ESC[38;5;255m"; C_GOLD="$ESC[38;5;179m"
-    C_PAPER_BOLD="$ESC[1;38;5;255m"; C_GOLD_BOLD="$ESC[1;38;5;179m"; C_RESET="$ESC[0m"
+  # the demo's colours are always on (it is made to be watched); --plain keeps them off
+  if [ "$PLAIN" = 0 ]; then
+    COLOUR=1; TRUECOLOR=0
+    if [ -z "$C_RESET" ]; then
+      C_PAPER="$ESC[38;5;255m"; C_GOLD="$ESC[38;5;179m"
+      C_PAPER_BOLD="$ESC[1;38;5;255m"; C_GOLD_BOLD="$ESC[1;38;5;179m"; C_RESET="$ESC[0m"
+    fi
   fi
   printf 'DEMO: nothing is installed; this runs the real install flow in a throwaway fake root.\n\n'
   demo_prepare || exit 1
@@ -748,7 +835,7 @@ files_identical() { # is what is installed byte-equal to this artifact?
     "usr/local/bin/$NAME:bin/spark-attic" \
     "usr/local/share/$NAME/header-art.txt:$AS/header-art.txt" \
     "usr/local/share/$NAME/header-col.txt:$AS/header-col.txt" \
-    "usr/local/share/$NAME/RELEASE-NOTES-0.1.0.md:$AS/RELEASE-NOTES-0.1.0.md" \
+    "usr/local/share/$NAME/RELEASE-NOTES-0.1.1.md:$AS/RELEASE-NOTES-0.1.1.md" \
     "usr/local/share/$NAME/README.md:$AS/README.md" \
     "usr/local/share/$NAME/INSTALL.md:$AS/INSTALL.md" \
     "usr/local/share/$NAME/STATUS-FILE.md:$AS/STATUS-FILE.md" \
@@ -791,6 +878,8 @@ main() {
     esac
     shift
   done
+  pick_colours
+  trap cleanup_tmp EXIT
   if [ "$JSON" = 1 ] && [ "$CHECK" = 0 ]; then
     say "--format json works with --check only"; exit 2
   fi
@@ -801,7 +890,7 @@ main() {
     demo_run
   fi
 
-  local tmpfetch=""
+  tmpfetch=""  # global on purpose: the EXIT trap removes it however the run ends
   if [ "$CHECK" = 1 ]; then
     if [ -n "$FROM" ]; then
       tmpfetch=$(mktemp -d)

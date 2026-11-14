@@ -50,7 +50,7 @@ grep -q "^built_on=" "$INFO" && ! grep -q "^built_on=$" "$INFO" && ok "built_on 
 
 # The release tools build the way release/build-release.sh builds them (the Makefile's flags plus
 # CFLAGS_PATHMAP over this tree and the zig installation): atticd and attic-check carry no host
-# path either (REVIEW-1112 finding 1 measured 20 and 13 /tank strings in the first tarball).
+# path either (the first tarball measured 20 and 13 private-path strings in it).
 ZIG=${ATTIC_ZIG:-$(command -v zig)}
 ZIGROOT=$(cd "$(dirname "$ZIG")/.." && pwd)
 if make -s -C "$HERE" OUT="$T/tools" CC="$ZIG cc -target aarch64-linux-gnu.2.28" \

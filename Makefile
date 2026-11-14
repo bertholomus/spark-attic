@@ -5,9 +5,12 @@
 # scripts/attic-build.sh, against that driver's own headers.
 CC ?= cc
 OUT ?= build/host
+# the one place the version is written; build-release.sh overrides it with its argument
+ATTIC_VERSION ?= 0.1.1
 CFLAGS ?= -std=gnu11 -O2 -g -Wall -Wextra -Wformat=2 -Wno-format-nonliteral -fstack-protector-strong -D_FORTIFY_SOURCE=2
-# The release build maps the build tree's and the zig toolchain's paths out of the debug info
-# (M4, REVIEW-1112 finding 1): release/build-release.sh fills CFLAGS_PATHMAP.
+CFLAGS += -DATTIC_VERSION_STR='"$(ATTIC_VERSION)"'
+# The release build maps the build tree's and the zig toolchain's paths out of the debug info:
+# release/build-release.sh fills CFLAGS_PATHMAP.
 CFLAGS += $(CFLAGS_PATHMAP)
 COMMON := src/util.c src/proto.c src/lend.c src/artifact.c src/sha256.c
 HEADERS := $(wildcard src/*.h)
@@ -34,8 +37,8 @@ $(OUT)/fakecuda/libcuda.so.1: tests/fakecuda.c | $(OUT)
 	mkdir -p $(OUT)/fakecuda
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ tests/fakecuda.c
 
-# Every upstream release the plugins support, when its clone is in cache/upstream/ (scripts/attic-engine-drift.sh
-# fetches the newest tags on top; a clone there that no shape matches fails the upstream case: drift). Each test
+# Every upstream release the plugins support, when its clone is in cache/upstream/ (a clone there that no
+# shape matches fails the upstream case: drift). Each test
 # takes only its own engine's sources: the other test refuses foreign --*-src arguments.
 VLLM_UPSTREAM := $(foreach v,vllm-0.24.0 vllm-0.32.0 vllm-0.33.0,$(if $(wildcard cache/upstream/$(v)),--vllm-src cache/upstream/$(v),))
 SGLANG_UPSTREAM := $(foreach v,sglang-0.5.14 sglang-0.5.21 sglang-0.5.23,$(if $(wildcard cache/upstream/$(v)),--sglang-src cache/upstream/$(v),))

@@ -80,13 +80,13 @@ if [ "$CAND" != "$DEST" ]; then  # earlier FAILED-* reports stay
 fi
 chmod 755 "$DEST"
 chmod 644 "$DEST/rmshim.so" "$DEST/BUILD-INFO"
-chmod 600 "$DEST"/check-*.json 2>/dev/null # reports carry physical addresses (N3), even copied over old ones
+chmod 600 "$DEST"/check-*.json 2>/dev/null # reports carry physical addresses, even copied over old ones
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 PASSED=()
 for m in $MODES; do
   SOCK=$RUN/candidate.sock
   rm -f "$DEST/check-$m.json"
-  # the candidate key goes beside the socket, root-only (umask 077), not on a command line (M3)
+  # the candidate key goes beside the socket, root-only (umask 077), not on a command line
   printf '%s\n' "$KEY" > "$CANDKEY"
   # shellcheck disable=SC2086
   "$BIN/atticd" --candidate "$DEST" --mode "$m" --socket "$SOCK" --key-file "$CANDKEY" --state "$RUN/candidate-ledger" \
@@ -113,7 +113,7 @@ done
 [ ${#PASSED[@]} -gt 0 ] || { say "driver $DRIVER: no mode passed; nothing enabled"; exit 1; }
 
 # Earlier reports in the candidate dir (this driver's and earlier FAILED-* ones from reruns) may come
-# from a run before the 0600 rule: tighten them all before the install (N3).
+# from a run before the 0600 rule: tighten them all before the install.
 for f in "$DEST"/check-*.json "$DEST"/FAILED-*.json; do
   [ -e "$f" ] && chmod 600 "$f"
 done
@@ -137,13 +137,13 @@ V
 chmod 755 "$NEW"
 for f in "$NEW"/*; do
   case $(basename "$f") in
-    check-*.json) chmod 600 "$f" ;; # the reports carry the regions' physical addresses (N3): root-only
+    check-*.json) chmod 600 "$f" ;; # the reports carry the regions' physical addresses: root-only
     *) chmod 644 "$f" ;;
   esac
 done
 rm -rf "$LIB/artifacts/.$DRIVER.old"
 [ -d "$LIB/artifacts/$DRIVER" ] && mv "$LIB/artifacts/$DRIVER" "$LIB/artifacts/.$DRIVER.old"
-# An install from before the 0600 rule leaves its reports world-readable in .old (N3): remove them -
+# An install from before the 0600 rule leaves its reports world-readable in .old: remove them -
 # the new install's reports are the ones that matter now.
 rm -f "$LIB/artifacts/.$DRIVER.old"/check-*.json
 mv "$NEW" "$LIB/artifacts/$DRIVER"

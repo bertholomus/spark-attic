@@ -11,7 +11,9 @@
     spark-attic uninstall [--purge] [--yes]
                                         remove everything install.sh put down; keeps the key
                                         and the logs unless --purge
-    spark-attic version                 one line: spark-attic 0.1.0
+    spark-attic demo [--fail STEP]      the install story on a fake node: what a first run
+                                        shows, one refusal path with --fail
+    spark-attic version                 one line: spark-attic 0.1.1
 
 Every path honours --root DIR (a fake root for the host tests). Colour and the brand header
 appear only on a colour TTY: piped output, NO_COLOR, TERM=dumb, ATTIC_COLOR=never or --plain
@@ -29,7 +31,7 @@ import sys
 import tempfile
 import time
 
-APP_VERSION = "0.1.0"  # build-release.sh stamps this to the release version
+APP_VERSION = "0.1.1"  # build-release.sh stamps this to the release version
 NAME = "spark-attic"
 
 # The icon kit's terminal colours: the frames and letters take the paper colour, the L nose the
@@ -374,7 +376,9 @@ def cmd_doctor(style, root="", as_json=False):
         if ok:
             style.out.write("  %s✓%s %s\n" % (style.gold, style.reset(), what))
         elif warn:
-            style.out.write("  ~ %s (fix when you can: %s)\n" % (what, fix))
+            # a warning with no advice prints no empty parenthetical
+            style.out.write("  ~ %s (fix when you can: %s)\n" % (what, fix) if fix
+                            else "  ~ %s\n" % what)
         else:
             style.out.write("  %s✗%s %s\n        %s\n" % (style.paper_bold, style.reset(), what, fix))
 
@@ -575,7 +579,10 @@ def main(argv=None):
             sp.add_argument("--fail", metavar="STEP",
                             help="show a refusal path: display, driver, lender or validate")
     a = ap.parse_args(argv)
-    if a.cmd in (None, "version"):
+    if a.cmd is None:
+        ap.print_help()
+        return 0
+    if a.cmd == "version":
         style = Style()
         style.out.write("%s %s\n" % (NAME, APP_VERSION))
         return 0

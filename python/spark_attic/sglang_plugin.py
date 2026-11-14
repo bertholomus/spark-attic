@@ -12,8 +12,8 @@ or as the home of named weights, in SGLang's model runner. It registers AROUND h
 
 There is no pinned SGLang version. The plugin knows two shapes of SGLang's KV sizing and, in each process, picks the
 one the running engine really has, by what its modules expose (the tables below; tests/test_sglang_plugin.py proves
-each shape against SGLang's own source for every supported release, and scripts/attic-engine-drift.sh runs that test
-against the newest release tags):
+each shape against SGLang's own source for every supported release; the plugin tests run against the newest
+release tags):
 
   0.5.14: the model runner's KV methods live in model_runner_kv_cache_mixin.ModelRunnerKVCacheMixin, the
           configurator is built from the model runner (create_memory_pool_configurator(mr)), and the plain MHA pool's

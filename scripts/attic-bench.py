@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright 2026 bertholomus
-"""attic-bench.py: what node-test-2.sh measures on one running server (OpenAI-compatible /v1/completions), and its
+"""attic-bench.py: measures one running server (OpenAI-compatible /v1/completions), and its
 summary. Standard library only.
 
     attic-bench.py --port 8000 [--model m] [--reps 3]          one JSON object on stdout

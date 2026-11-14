@@ -10,7 +10,7 @@
 #
 # Reproducible: two runs give the same tarball sha256 - in the same directory or in different
 # ones. SOURCE_DATE_EPOCH pins every timestamp (default: the committer date of HEAD);
-# attic-build.sh maps the shim's toolchain and source paths away (M4), and the tools build maps
+# attic-build.sh maps the shim's toolchain and source paths away, and the tools build maps
 # this tree's and zig's paths away the same way (CFLAGS_PATHMAP), so the binaries carry no build
 # path; the tar is sorted with fixed mtimes and owners; gzip -n drops its own timestamp.
 #
@@ -36,7 +36,7 @@ say() { printf 'build-release: %s\n' "$*" >&2; }
 [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { say "not a product version: $V (x.y.z)"; exit 2; }
 export SOURCE_DATE_EPOCH=$SDE
 
-# The published artifact is built from an export (release/KIT.md step 2): the private tree's files
+# The published artifact is built from an export: the private tree's files
 # name our hosts, people and projects, and a build here would pack them. The tests build from a
 # staged export too; ATTIC_BUILD_PRIVATE_OK=1 is the override for a deliberate private build.
 if [ -e "$HERE/release/export.sh" ] && [ "${ATTIC_BUILD_PRIVATE_OK:-0}" != 1 ]; then
@@ -50,9 +50,9 @@ export ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR:-$HERE/cache/zig-global}
 export ZIG_LOCAL_CACHE_DIR=${ZIG_LOCAL_CACHE_DIR:-$HERE/cache/zig-local}
 ZIGROOT=$(cd "$(dirname "$ZIG")/.." && pwd)
 # -s strips at link: zig's prebuilt libc startup objects (crt1, csu) carry their own build paths in
-# their debug info, which no -ffile-prefix-map of ours reaches (REVIEW-1112 finding 1).
+# their debug info, which no -ffile-prefix-map of ours reaches.
 say "building the tools for aarch64 (zig cc, the tree's and zig's paths mapped away, stripped)"
-make -s -C "$HERE" OUT=build/release-aarch64 CC="$ZIG cc -target aarch64-linux-gnu.2.28" \
+make -s -C "$HERE" OUT=build/release-aarch64 CC="$ZIG cc -target aarch64-linux-gnu.2.28" ATTIC_VERSION="$V" \
   CFLAGS_PATHMAP="-ffile-prefix-map=$HERE=. -ffile-prefix-map=$ZIGROOT=. -s" \
   build/release-aarch64/atticd build/release-aarch64/attic-check
 
@@ -77,15 +77,22 @@ cp "$HERE/build/release-aarch64/atticd" "$HERE/build/release-aarch64/attic-check
 sed "s/^APP_VERSION = .*/APP_VERSION = \"$V\"/" "$HERE/scripts/spark-attic" >"$STAGE/bin/spark-attic"
 chmod 755 "$STAGE/bin/spark-attic"
 printf '%s\n' "$V" >"$STAGE/VERSION"
-sed "s/^VERSION=\${INSTALL_VERSION:-0.1.0}/VERSION=\${INSTALL_VERSION:-$V}/" "$HERE/install.sh" \
+sed "s/^VERSION=\${INSTALL_VERSION:-[0-9.]*/VERSION=\${INSTALL_VERSION:-$V/" "$HERE/install.sh" \
   >"$STAGE/install.sh"
 chmod 755 "$STAGE/install.sh"
 cp "$HERE/scripts/attic-validate.sh" "$STAGE/scripts/"
 cp "$HERE/systemd/attic.service" "$STAGE/systemd/"
 cp "$HERE/sysctl/99-spark-attic-minfree.conf" "$STAGE/sysctl/"
 cp -r "$HERE/python/." "$STAGE/python/"
+# the python package carries its version in three places: stamp them like the CLI and install.sh
+sed -i "s/^__version__ = .*/__version__ = \"$V\"/" "$STAGE/python/spark_attic/__init__.py"
+sed -i "s/^version = .*/version = \"$V\"/" "$STAGE/python/pyproject.toml"
+for _di in "$STAGE"/python/spark_attic-[0-9]*.dist-info; do
+  [ "$_di" = "$STAGE/python/spark_attic-$V.dist-info" ] || mv "$_di" "$STAGE/python/spark_attic-$V.dist-info"
+done
+sed -i "s/^Version: .*/Version: $V/" "$STAGE/python/spark_attic-$V.dist-info/METADATA"
 # the docs: the working tree keeps them under release/, the exported tree at its root
-for f in README.md INSTALL.md RELEASE-NOTES-0.1.0.md; do
+for f in README.md INSTALL.md RELEASE-NOTES-0.1.1.md; do
   src=$HERE/release/$f
   [ -f "$src" ] || src=$HERE/$f
   [ -f "$src" ] && cp "$src" "$STAGE/share/spark-attic/$f"
@@ -125,10 +132,10 @@ find "$STAGE" -name __pycache__ -type d -prune -exec rm -rf {} +
 # every staged file root-readable, scripts and binaries executable, no group/other write
 chmod -R u=rwX,go=rX "$STAGE"
 
-# the tarball is scanned before it exists: a private string must not become the release
-# (finding 1). The scanner and its pattern list name our people, hosts and accounts, so they
+# the tarball is scanned before it exists: a private string must not become the release.
+# The scanner and its pattern list name our people, hosts and accounts, so they
 # stay in the private tree and never ship in an export: the release build points
-# ATTIC_PRIVACY_SCAN at the private scan (KIT.md, publish step). An exported build scans when
+# ATTIC_PRIVACY_SCAN at the private scan. An exported build scans when
 # that variable names one, and otherwise says so in one line and continues - a missing scan
 # must never fail a public user's build.
 SCAN=${ATTIC_PRIVACY_SCAN:-$HERE/release/privacy-scan.sh}
@@ -145,6 +152,7 @@ fi
 cd "$STAGE"
 find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort |
   xargs sha256sum >SHA256SUMS
+chmod 644 SHA256SUMS  # the umask writes this file, and the tarball carries its mode: 0644 whatever the build ran with
 mkdir -p "$OUTROOT"
 # the tarball's top folder is spark-attic-VERSION (install.sh reads VERSION and SHA256SUMS in it)
 cd "$OUTROOT"
@@ -158,7 +166,7 @@ sha256sum "$NAME-$V-aarch64.tar.gz" | awk '{print $1}' >"$NAME-$V-aarch64.tar.gz
 
 # The standalone installer is published beside the tarball as its own asset, so a curl|bash run
 # never sees the .sha256 sidecar: bake the tarball's sha256 into it and let install.sh's fetch
-# check the download against that (REVIEW-1112 finding 6). The tarball's own installer verifies
+# check the download against that. The tarball's own installer verifies
 # against the SHA256SUMS it travels with and needs no stamp.
 SUM=$(awk '{print $1}' "$NAME-$V-aarch64.tar.gz.sha256")
 sed "s|^SYSCTL_NAME=.*|&\nATTIC_SHA256=$SUM|" "$NAME-$V/install.sh" >"$OUTROOT/install.sh"

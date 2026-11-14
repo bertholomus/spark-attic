@@ -50,7 +50,10 @@ class _AfterImport(importlib.abc.MetaPathFinder):
         for finder in sys.meta_path:
             if finder is self or not hasattr(finder, "find_spec"):
                 continue
-            spec = finder.find_spec(name, path, target)
+            try:
+                spec = finder.find_spec(name, path, target)
+            except Exception:
+                continue  # a broken finder must not break the imports a hook waits for
             if spec is not None:
                 break
         else:

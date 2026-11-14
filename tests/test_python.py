@@ -123,7 +123,7 @@ def case_fail_open(rig):
 
 
 def case_unit(rig):
-    """systemd/attic.service: the hardening is there and the pieces atticd needs are not locked out (S5)."""
+    """systemd/attic.service: the hardening is there and the pieces atticd needs are not locked out."""
     unit = {}
     section = None
     for line in open(os.path.join(ROOT, "systemd", "attic.service")):
@@ -140,7 +140,7 @@ def case_unit(rig):
                  "ProtectKernelTunables", "ProtectKernelModules", "ProtectKernelLogs", "ProtectControlGroups",
                  "ProtectClock", "ProtectHostname", "RestrictSUIDSGID", "LockPersonality", "RestrictAddressFamilies"]
     missing = [k for k in hardening if k not in unit]
-    check(not missing, "the hardening lines are there (S5); missing: %r" % missing)
+    check(not missing, "the hardening lines are there; missing: %r" % missing)
     check(unit.get("ProtectSystem") == ["strict"] and unit.get("ReadWritePaths") == ["-/run/spark-attic"],
           "the whole filesystem read-only except the runtime directory")
     check(unit.get("RestrictAddressFamilies") == ["AF_UNIX"], "AF_UNIX is the only socket family")
@@ -178,12 +178,12 @@ def case_borrow(rig):
     raw = spark_attic.Pool(settings=s).map(0, [62 * MIB])
     check(raw.read(0, 4096) == pattern(4096, 0) and raw.read(30 * MIB + 12345, 4096) == pattern(4096, 57)
           and raw.read(m.size - 4096, 4096) == pattern(4096, 0),
-          "the same slice raw (Pool.map): the previous holder's bytes are still there (S3)")
+          "the same slice raw (Pool.map): the previous holder's bytes are still there")
     raw.close()
     m = spark_attic.borrow(settings=s)  # borrow() zeroes the slice before returning it
     check(m is not None and m.read(0, 4096) == bytes(4096) and m.read(30 * MIB + 12345, 4096) == bytes(4096)
           and m.read(m.size - 4096, 4096) == bytes(4096),
-          "borrow() zeroes the slice: the previous holder's bytes are gone (S3)")
+          "borrow() zeroes the slice: the previous holder's bytes are gone")
     m.zero()
     check(m.read(m.size - 64, 64) == bytes(64), "zero() clears it")
     m.close()
@@ -334,7 +334,68 @@ def case_protocol(rig):
     check(fds_open() == n, "no descriptor leaked: %d then %d" % (n, fds_open()))
 
 
-CASES = [case_settings, case_unit, case_fail_open, case_borrow, case_pool, case_tensor, case_protocol]
+def case_versions(rig):
+    """the version lives in one place: the Makefile's ATTIC_VERSION, quoted by every site that carries it."""
+    mk_version = ""
+    for line in open(os.path.join(ROOT, "Makefile")):
+        if line.startswith("ATTIC_VERSION") and "?=" in line:
+            mk_version = line.split("?=")[1].split("#")[0].strip()
+    check(bool(mk_version), "the Makefile names the version (ATTIC_VERSION ?= X)")
+    atticd = open(os.path.join(ROOT, "src", "atticd.c")).read()
+    check("#define ATTICD_VERSION ATTIC_VERSION_STR" in atticd and "#ifndef ATTIC_VERSION_STR" in atticd,
+          "atticd.c takes its version from the build")
+    checkc = open(os.path.join(ROOT, "src", "attic-check.c")).read()
+    check("#define CHECK_VERSION ATTIC_VERSION_STR" in checkc and "#ifndef ATTIC_VERSION_STR" in checkc,
+          "attic-check.c takes its version from the build")
+    init = open(os.path.join(ROOT, "python", "spark_attic", "__init__.py")).read()
+    check('__version__ = "%s"' % mk_version in init, "the python package is %s" % mk_version)
+    pyproject = open(os.path.join(ROOT, "python", "pyproject.toml")).read()
+    check('version = "%s"' % mk_version in pyproject, "pyproject.toml is %s" % mk_version)
+    dist = [d for d in os.listdir(os.path.join(ROOT, "python"))
+            if d.startswith("spark_attic-") and d.endswith(".dist-info")]
+    check(dist == ["spark_attic-%s.dist-info" % mk_version], "the dist-info folder is the same version: %r" % dist)
+    cli = open(os.path.join(ROOT, "scripts", "spark-attic")).read()
+    check('APP_VERSION = "%s"' % mk_version in cli, "the CLI is %s" % mk_version)
+    inst = open(os.path.join(ROOT, "install.sh")).read()
+    check("VERSION=${INSTALL_VERSION:-%s}" % mk_version in inst, "install.sh defaults to %s" % mk_version)
+
+
+def case_raising_finder(rig):
+    """a broken finder in sys.meta_path must not break the imports a hook waits for."""
+    import importlib
+    import shutil
+    import spark_attic._place as place
+    d = tempfile.mkdtemp(prefix="spark-attic-finder-")
+    fake = "spark_attic_raising_case_module"
+    with open(os.path.join(d, fake + ".py"), "w") as f:
+        f.write("MARK = 1\n")
+    seen = []
+    place.when_imported(fake, lambda m: seen.append(m.__name__))
+
+    class Broken:
+        def find_spec(self, name, path=None, target=None):
+            raise RuntimeError("broken finder")
+
+    broken = Broken()
+    sys.meta_path.insert(sys.meta_path.index(place._finder) + 1, broken)
+    sys.path.insert(0, d)
+    try:
+        try:
+            mod = importlib.import_module(fake)
+            ok, why = mod.MARK == 1 and seen == [fake], "hook seen=%r" % (seen,)
+        except Exception as e:
+            ok, why = False, "import raised %s: %s" % (type(e).__name__, e)
+        check(ok, "the import survives a raising finder and the hook still fires (%s)" % why)
+    finally:
+        sys.meta_path.remove(broken)
+        sys.path.remove(d)
+        place._finder.hooks.pop(fake, None)
+        sys.modules.pop(fake, None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+CASES = [case_settings, case_versions, case_unit, case_fail_open, case_borrow, case_pool, case_tensor,
+         case_protocol, case_raising_finder]
 
 
 def main():

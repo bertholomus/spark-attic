@@ -174,15 +174,15 @@ def main():
         for f in ("check-heap.json", "check-list.json"):
             p = os.path.join(art, f)
             check(os.path.exists(p) and oct(os.stat(p).st_mode & 0o777) == "0o600",
-                  "%s is 0600, not world-readable (N3)" % f)
+                  "%s is 0600, not world-readable" % f)
         for f in ("rmshim.so", "BUILD-INFO", "VALIDATED"):
             p = os.path.join(art, f)
-            check(oct(os.stat(p).st_mode & 0o777) == "0o644", "%s stays 0644 (N3)" % f)
-        check(oct(os.stat(art).st_mode & 0o777) == "0o755", "the artifact directory stays 0755 (N3)")
+            check(oct(os.stat(p).st_mode & 0o777) == "0o644", "%s stays 0644" % f)
+        check(oct(os.stat(art).st_mode & 0o777) == "0o755", "the artifact directory stays 0755")
         # M3: nothing this node's run put a key on a command line - sampled live by validate(), because
         # the candidate daemons live only while it runs.
         check(not n.cmdline_leaks,
-              "no atticd or attic-check of this run holds a key in /proc (M3): %r" % n.cmdline_leaks[:2])
+              "no atticd or attic-check of this run holds a key in /proc: %r" % n.cmdline_leaks[:2])
         time.sleep(0.5)
         r = info(sock)
         check(r["ok"] is True and r["size"] == 128 << 20, "told by SIGHUP, the node's atticd lends: %r" % r)
@@ -277,17 +277,23 @@ def main():
         rc, err = n.validate()
         check(rc == 0, "an update over the old install passes (%d) %s" % (rc, err[-300:]))
         check(not os.path.exists(os.path.join(old_art, "check-heap.json")),
-              ".old's check-heap.json is gone after the update (N3)")
+              ".old's check-heap.json is gone after the update")
         check(not os.path.exists(os.path.join(old_art, "check-list.json")),
-              ".old's check-list.json is gone after the update (N3)")
+              ".old's check-list.json is gone after the update")
         check(oct(os.stat(failed).st_mode & 0o777) == "0o600",
-              "the kept FAILED-* report is 0600 after the update (N3)")
+              "the kept FAILED-* report is 0600 after the update")
         new_art = os.path.join(n.lib, "artifacts", "999.0.1")
         for f in ("check-heap.json", "check-list.json"):
             p = os.path.join(new_art, f)
-            check(oct(os.stat(p).st_mode & 0o777) == "0o600", "the new install's %s is 0600 (N3)" % f)
+            check(oct(os.stat(p).st_mode & 0o777) == "0o600", "the new install's %s is 0600" % f)
     finally:
         n.done()
+    # the usage text must name --key-file: the docs send the key by file, never on a command line
+    r = subprocess.run([os.path.join(bindir, "attic-check"), "--bogus-option"],
+                       capture_output=True, text=True, timeout=10)
+    check("--key-file" in r.stderr and "--key KEY" in r.stderr,
+          "attic-check's usage names both --key and --key-file")
+
     print("test_validate: %d failures" % len(FAILS))
     return 1 if FAILS else 0
 

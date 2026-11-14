@@ -1,7 +1,9 @@
 # Installing spark-attic
 
-> Headless boxes are the tested case: atticd refuses to lend while a
-> display is connected, and lends again when it goes away (README, Supported).
+> Headless boxes are the tested case: atticd lends nothing while a display is in use - a process
+> holding `/dev/nvidia-modeset`, a graphics (type G) process in the GPU process list, or a DRM
+> connector reporting `connected` - and lends again only after the signals read idle for several
+> ticks in a row (README, Supported).
 
 Three parts: build on any Linux machine, install and validate on each GB10 node, then let your engines borrow.
 Everything that touches the node runs as root.
@@ -16,8 +18,11 @@ Everything that touches the node runs as root.
 - **Engines (optional):** vLLM 0.24.0, 0.31.0 or 0.32.0, SGLang 0.5.14 or 0.5.23 (NGC 26.07 ships the older pair, 26.10 ships vLLM 0.31.0), Python
   3.9+. Other releases work too as long as the engine still has the code shape a plugin knows: on one it does not,
   the KV placement turns itself off with one log line and the engine runs as without spark-attic.
-- **A display:** none needed. atticd lends nothing while a DRM connector reports `connected` and resumes when it
-  does not (README, Supported); `--drm-dir` points the check at a different connector tree (tests).
+- **A display:** none needed. atticd lends nothing while a display is in use: a process other than
+  `nvidia-persistenced` holding `/dev/nvidia-modeset`, a graphics (type G) process in `nvidia-smi pmon`,
+  or a DRM connector reporting `connected` (stock DGX OS has no connector state, so the first two carry
+  the verdict there). The verdict is held across ticks, and lending resumes only after several idle
+  readings in a row (README, Supported); `--drm-dir` points the check at a different connector tree (tests).
 
 ## 2. Build (on the build host)
 
@@ -66,8 +71,8 @@ else can put anything in front of these files.
 `scripts/attic-update.sh 580.178.04 <node>` builds the shim and the tools, stages them on the node and runs step 4
 there in one go (it needs ssh to the node and `sudo -n` there). It does not install anything: do step 3 once.
 
-`release/build-release.sh 0.1.0` makes the whole release artifact instead of a hand-staged
-folder: `spark-attic-0.1.0-aarch64.tar.gz` with atticd, attic-check, the driver shims for the
+`release/build-release.sh 0.1.1` makes the whole release artifact instead of a hand-staged
+folder: `spark-attic-0.1.1-aarch64.tar.gz` with atticd, attic-check, the driver shims for the
 compatibility list, the scripts, the Python package, the unit, the docs and SHA256SUMS — the
 tarball step 3 installs. The build is reproducible (two runs, one sha256). The node needs no
 compiler and no zig either way.
@@ -77,14 +82,14 @@ compiler and no zig either way.
 One command:
 
 ```
-curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.0/install.sh | sudo bash
+curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.1/install.sh | sudo bash
 ```
 
 or, for an offline copy of the release tarball (the curl form fetches and verifies the same
 tarball from the release URL):
 
 ```
-install.sh --from spark-attic-0.1.0-aarch64.tar.gz
+install.sh --from spark-attic-0.1.1-aarch64.tar.gz
 ```
 
 What it does, in order:
@@ -123,7 +128,7 @@ down):
 ```
 cd /root/spark-attic
 install -m 0755 bin/atticd /usr/local/sbin/atticd
-install -m 0755 bin/attic-check /usr/local/bin/attic-check
+install -m 0755 bin/attic-check /usr/local/sbin/attic-check
 install -d -m 0755 /var/lib/attic /var/lib/attic/artifacts /etc/spark-attic
 (umask 077; od -An -N12 -tx1 /dev/urandom | tr -d ' \n' | sed 's/^/attic_/' > /etc/spark-attic/key)
 install -m 0644 systemd/attic.service /etc/systemd/system/attic.service
@@ -176,7 +181,7 @@ nothing is enabled (exit 1) and the reports stay in `/var/lib/attic/candidates/5
 systemctl enable --now attic.service        # install.sh does this when validate passed
 spark-attic status                          # state, MiB lent, clients, driver, validated
 cat /run/spark-attic/status.json            # the same file, keyless (STATUS-FILE.md)
-attic-check --status --key "$(cat /etc/spark-attic/key)"   # the same, with the region's details
+attic-check --status --key-file /etc/spark-attic/key        # the same, with the region's details
 ```
 
 `spark-attic doctor` runs the preflight plus the live checks (the unit, the key's mode, the
@@ -267,7 +272,7 @@ socket, binary or artifact is left. By hand, the same thing:
 
 ```
 systemctl disable --now attic.service
-rm -f /usr/local/sbin/atticd /usr/local/bin/attic-check /etc/systemd/system/attic.service
+rm -f /usr/local/sbin/atticd /usr/local/sbin/attic-check /etc/systemd/system/attic.service
 rm -rf /var/lib/attic /etc/spark-attic /run/spark-attic
 systemctl daemon-reload
 ```

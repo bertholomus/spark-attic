@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright 2026 bertholomus
-"""attic-preflight.py vllm|sglang: run in the framework's image before node-test-2.sh starts its servers. One PASS or
+"""attic-preflight.py vllm|sglang: run in the framework's image before the servers start. One PASS or
 FAIL line per check; exit 0 when all pass.
 
   1. the client: atticd's info, a 64 MiB slice as a torch tensor that round-trips data, and 32 MiB of device memory

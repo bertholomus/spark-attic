@@ -310,7 +310,7 @@ def case_refusals(rig):
     rig.artifact(DRIVER, sha="0" * 64)
     refusing("does not match its VALIDATED digest")
     rig.artifact(DRIVER, modes="heap")
-    cand = rig.artifact(DRIVER, validated=False)  # list mode only runs as a candidate (S4); a candidate runs
+    cand = rig.artifact(DRIVER, validated=False)  # list mode only runs as a candidate; a candidate runs
     refusing("RM uses part of the display carveout", "--mode", "list", "--candidate", cand)  # unvalidated, so the
     rig.artifact(DRIVER, modes="heap,list")  # modes gate is the node check's, not the daemon's
     rig.set_driver("999.0.2")  # a driver no artifact was built for
@@ -355,11 +355,11 @@ def case_refusals(rig):
     rig.stop()
     p = subprocess.run(rig.args("--keep-mib", "3"), capture_output=True, timeout=10)
     check(p.returncode == 2 and "not a whole number of 2 MiB slices" in p.stderr.decode(),
-          "--keep-mib 3: refused with why (M2): %r" % p.stderr.decode().strip().splitlines()[-1:])
+          "--keep-mib 3: refused with why: %r" % p.stderr.decode().strip().splitlines()[-1:])
     p = subprocess.run(rig.args("--keep-mib", "abc"), capture_output=True, timeout=10)
     check(p.returncode == 2, "--keep-mib abc: refused")
 
-    # N5: a persistently failing RM client is reopened, not served refusals forever
+    # a persistently failing RM client is reopened, not served refusals forever
     failfile = os.path.join(rig.dir, "shim-fail")
     open(failfile, "w").write("")
     rig.start(env={"ATTIC_FAKE_FAIL_FILE": failfile})
@@ -376,7 +376,7 @@ def case_refusals(rig):
         check(r["ok"] is False, "shim failing: alloc %d refused" % (i + 1))
     st = status_file(os.path.join(rig.dir, "status.json"),
                      lambda s_: s_["state"] == "refusing" and "reopening" in s_["why"], 12.0)
-    check(st is not None, "three failures in a row: the RM client is torn down and reopened (N5): %r"
+    check(st is not None, "three failures in a row: the RM client is torn down and reopened: %r"
           % (st or {}).get("why"))
     st = status_file(os.path.join(rig.dir, "status.json"),
                      lambda s_: s_["state"] == "refusing" and "carveout" in s_["why"], 12.0)
@@ -404,7 +404,7 @@ def case_export_failure(rig):
 
 def case_list_mode(rig):
     env = {"ATTIC_FAKE_HELD": "0"}
-    # not released (S4): a real list-mode daemon refuses; only a candidate runs list, for the node check
+    # not released: a real list-mode daemon refuses; only a candidate runs list, for the node check
     rig.start("--mode", "list", env=env)
     st = ask(rig.sock, '{"key":"%s","op":"status"}' % KEY)
     check(st["state"] == "refusing" and "mode list is not released" in st["why"],
@@ -420,6 +420,13 @@ def case_list_mode(rig):
     whole = 2048 * MIB
     inf = ask(rig.sock, info_req())
     check(inf["ok"] is True and inf["size"] == whole and inf["free"] == whole, "list mode: 2,048 MiB: %r" % inf)
+    big = (2 ** 32 + 100) * SLICE  # more slices than a 32-bit count can name: the cut must not shrink it into a fit
+    big_r = ask(rig.sock, '{"key":"%s","op":"alloc","size":%d}' % (KEY, big))
+    big_why = big_r.get("why") or big_r.get("error") or ""
+    check(big_r.get("ok") is False and "no free run" in big_why,
+          "an alloc bigger than the whole ledger refuses with the fit line: %r" % big_r)
+    inf = ask(rig.sock, info_req())
+    check(inf["ok"] is True and inf["free"] == whole, "the oversized alloc lent nothing: %r" % inf)
     check("base" not in inf or os.geteuid() == 0, "the physical base only goes to root")
     pid, line = holder(rig.sock, 1024 * MIB)
     check(line == "ok", "list alloc")
@@ -831,7 +838,7 @@ def case_display3(rig):
 
 
 def case_display4(rig):
-    """B3-R-OSCILLATION: the display verdict is held across ticks, not re-derived from one instant. On a
+    """The display verdict is held across ticks, not re-derived from one instant. On a
     real GB10 desktop the samples are sparser than the 2 s tick (the 256-pid modeset pass finds the holder
     only on the ticks whose pass reaches it; pmon runs every 30 s), and at adcbc74 the ready flag flipped
     with them: 12 of 20 borrows succeeded while a desktop was up the whole time. Here the fake signal is
@@ -1054,10 +1061,58 @@ def case_display(rig):
     rig.stop()
 
 
-CASES = [case_heap_lend_and_reclaim, case_heap_drain, case_requests, case_refusals, case_export_failure, case_list_mode,
+
+def case_pmon_hang(rig):
+    """A hung nvidia-smi must not hold the daemon's only thread: the sample is cut by a time limit,
+    the last verdict stands, and the daemon still answers while the tool hangs. The modeset and DRM
+    signals stay readable, so the node keeps lending (a pmon that cannot run is not evidence)."""
+    fb = os.path.join(rig.dir, "fakebin")
+    os.makedirs(fb, exist_ok=True)
+    with open(os.path.join(fb, "nvidia-smi"), "w") as f:
+        f.write("#!/bin/sh\nsleep 30\nexit 1\n")
+    os.chmod(os.path.join(fb, "nvidia-smi"), 0o755)
+    rig.start(env={"PATH": fb + ":" + os.environ["PATH"]})
+    t0 = time.time()
+    st = ask(rig.sock, '{"key":"%s","op":"status"}' % KEY)
+    dt = time.time() - t0
+    check(dt < 15, "status answered while nvidia-smi hangs (%.1fs)" % dt)
+    check(st["state"] == "ready", "the daemon came up anyway (%r)" % st.get("state"))
+    log = open(rig.log).read()
+    check("holding the last display verdict" in log, "the failed pmon sample is logged")
+    rig.stop()
+
+
+def case_silent_client(rig):
+    """a connection that never speaks gives up its slot: the daemon drops it inside the handshake deadline."""
+    rig.start()
+    silent = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    silent.settimeout(18)
+    silent.connect(rig.sock)
+    st = ask(rig.sock, '{"key":"%s","op":"status"}' % KEY)
+    check(st.get("clients") == 2, "the silent connection holds a slot: %r" % st.get("clients"))
+    gone = False
+    try:
+        gone = silent.recv(1) == b""  # nothing is ever sent to a silent client; only the drop closes it
+    except socket.timeout:
+        pass
+    check(gone, "the daemon drops a silent connection inside the deadline")
+    free = False  # the status file is stamped by the tick, so poll briefly for the freed slot
+    t_end = time.time() + 6
+    while time.time() < t_end:
+        st = ask(rig.sock, '{"key":"%s","op":"status"}' % KEY)
+        # the ask itself is one client while the status is written: only the silent slot must be gone
+        if st.get("clients") == 1:
+            free = True
+            break
+        time.sleep(0.5)
+    check(free, "the slot is free again after the drop (status %r)" % st.get("clients"))
+    rig.stop()
+
+
+CASES = [case_pmon_hang, case_heap_lend_and_reclaim, case_heap_drain, case_requests, case_refusals, case_export_failure, case_list_mode,
          case_sighup, case_candidate_keep_probe, case_socket_path, case_status_file, case_display, case_display3,
          case_display4, case_display_beyond_budget, case_attic_check,
-         case_region_kinds]
+         case_region_kinds, case_silent_client]
 
 
 def main():
@@ -1084,3 +1139,5 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

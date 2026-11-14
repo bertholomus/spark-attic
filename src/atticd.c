@@ -50,10 +50,15 @@
 #include "proto.h"
 #include "shim.h"
 
-#define ATTICD_VERSION "0.1.0"
+/* the version comes from the Makefile (ATTIC_VERSION); the fallback keeps a bare cc build honest */
+#ifndef ATTIC_VERSION_STR
+#define ATTIC_VERSION_STR "0.1.1"
+#endif
+#define ATTICD_VERSION ATTIC_VERSION_STR
 #define TICK_S 2
 #define MAX_REGIONS 8
 #define MAX_STRIKES 3
+#define HANDSHAKE_S 10 /* how long a connection that never speaks may hold a client slot */
 #define MiB(x) ((unsigned long long)((x) >> 20))
 
 static struct config {
@@ -106,6 +111,8 @@ struct client {
     struct holder who;
     struct lend *lends;
     int nlends, strikes;
+    time_t since; /* when the connection was accepted */
+    int said;     /* the client has sent a message (any message counts, even a wrong key) */
 };
 
 struct drain { /* mode heap: bytes a closed client may still hold through CUDA, until RM has them back */
@@ -119,7 +126,7 @@ static struct {
     int validated; /* the running driver's artifact is VALIDATED for this mode (not a candidate) */
     int display_block; /* the ready flag is down because a display is in use (st.dwhy says so) */
     char dwhy[384];    /* the display refusal text of the held block (st.why can name a newer reason) */
-    int display_idle;  /* complete idle readings in a row while the block is held (B3-R-OSCILLATION) */
+    int display_idle;  /* complete idle readings in a row while the block is held */
     char why[512];
     void *dl;
     const struct attic_shim *shim;
@@ -143,7 +150,7 @@ static struct {
     /* clients */
     struct client **clients;
     int nclients;
-    int rm_strikes;   /* consecutive RM failures a client saw (N5: a broken RM client is reopened) */
+    int rm_strikes;   /* consecutive RM failures a client saw: a broken RM client is reopened */
     time_t next_retry;
 } st;
 
@@ -164,7 +171,7 @@ static DIR *modeset_scan; /* the scan's place in /proc: 256 entries a tick, the 
 /* What the scan says: the verdict of the last COMPLETE pass (modeset_last, -1 before one has finished),
  * refreshed the tick a pass finishes. A pass that ran out of its 256-look budget holds that verdict
  * rather than re-deriving from the half it reached: the holder sits in the part a mid-pass tick has not
- * looked at (B3-R-OSCILLATION: on a real GB10 the pass spans two ticks, so per-tick re-derivation made
+ * looked at (on a real GB10 the pass spans two ticks, so per-tick re-derivation made
  * the verdict alternate and borrows through on the idle-reading ticks). */
 static int modeset_verdict;
 static int modeset_last = -1;
@@ -258,8 +265,7 @@ static int modeset_holder(char *who, size_t n, int complete)
 static time_t pmon_at; /* the last pmon run: nvidia-smi costs a second, the tick cannot spend it */
 
 /* What pmon says: the verdict of the last FRESH sample (pmon_last, -1 before one has been read), held
- * across the ticks between the 30 s runs - a cached no is the sample's verdict, not a new reading
- * (B3-R-OSCILLATION). A run that fails to read holds the last sample's verdict too; -1 only before the
+ * across the ticks between the 30 s runs - a cached no is the sample's verdict, not a new reading. A run that fails to read holds the last sample's verdict too; -1 only before the
  * first sample ever read. */
 static int pmon_verdict;
 static int pmon_last = -1;
@@ -282,15 +288,23 @@ static int graphics_process(char *who, size_t n)
         }
         buf[len] = 0;
     } else {
-        FILE *p = popen("nvidia-smi pmon -c 1 -s u 2>/dev/null", "r");
+        /* The sample carries a time limit: a hung nvidia-smi would otherwise hold the daemon's only
+         * thread, and nothing would restart it (no failure to see). timeout ends the tool, and a run
+         * that fails or is cut holds the last sample's verdict (it is not evidence of its own). */
+        FILE *p = popen("timeout 5 nvidia-smi pmon -c 1 -s u 2>/dev/null", "r");
         if (p == NULL) {
             pmon_verdict = pmon_last;
             return pmon_verdict > 0;
         }
         len = fread(buf, 1, sizeof buf - 1, p);
         buf[len] = 0;
-        pclose(p);
+        int rc = pclose(p);
         pmon_at = time(NULL);
+        if (rc != 0) {
+            LOGW("nvidia-smi pmon failed (rc %d): holding the last display verdict", rc);
+            pmon_verdict = pmon_last;
+            return pmon_verdict > 0;
+        }
     }
     char *line = buf;
     while (line && *line) {
@@ -323,7 +337,7 @@ static int graphics_process(char *who, size_t n)
     return 0;
 }
 
-/* A display in use, by any of the three signals (STEER 11's node readings): (a) a process other than
+/* A display in use, by any of the three signals: (a) a process other than
  * nvidia-persistenced holds /dev/nvidia-modeset, (b) the GPU lists a graphics (type G) process, (c) a
  * DRM connector reports "connected" (the KMS systems; on stock DGX OS with nvidia-drm modeset=0 there
  * are no connector dirs at all, so (a) and (b) carry the verdict there). atticd lends RM's free display
@@ -334,7 +348,7 @@ static int graphics_process(char *who, size_t n)
  * The return says what to do about this tick's evidence, and the verdict that gates lending is held
  * across ticks in display_watch: signals (a) and (b) are read on their own cadence (the modeset pass
  * spans ticks, pmon runs every 30 s), and re-deriving per tick from one instant made the refusal
- * oscillate on a real GB10 desktop (B3-R-OSCILLATION). 1 in use (a signal fired now, or its last
+ * oscillate on a real GB10 desktop. 1 in use (a signal fired now, or its last
  * complete reading found one and has not been replaced), 0 the readable signals read idle, -1 nothing
  * readable at all (no evidence either way; it never blocks). complete: run the modeset scan to the end of the
  * directory (the one-shot callers: --probe-display, bring-up and SIGHUP); the tick keeps its budget. */
@@ -427,7 +441,7 @@ static uint64_t rm_out(void)
     return (uint64_t)(ledger_count(&st.ledger, SLICE_LENT) + ledger_count(&st.ledger, SLICE_DRAINING)) * ATTIC_SLICE;
 }
 
-/* An RM call a client saw fail (N5): three in a row mean the RM client is broken, not the request. With nothing
+/* An RM call a client saw fail: three in a row mean the RM client is broken, not the request. With nothing
  * lent, the client is torn down and reopened (the next tick brings a fresh one up); with slices out, reopening
  * would orphan the memory they hold, so atticd keeps serving refusals until the last client drops, and the tick
  * reopens then. A success clears the strikes. */
@@ -670,7 +684,7 @@ static void bring_up(void)
     char why[512] = "";
     st.next_retry = time(NULL) + cfg.retry_s;
     if (st.display_block) {
-        /* The held display verdict stands (B3-R-OSCILLATION): a retry does not re-derive it from one
+        /* The held display verdict stands: a retry does not re-derive it from one
          * instant, because a scan pass that ran out of its 256-look budget or a throttled pmon can read
          * idle while the desktop is still up. Only display_watch's streak of complete idle readings
          * lifts the block. Nothing below runs, so the artifact state the last bring-up found stands. */
@@ -678,7 +692,7 @@ static void bring_up(void)
         goto refuse;
     }
     st.validated = 0;
-    /* Mode list is not released (S4): no node ever passed it (580.178.04 refuses memory lists), and its safety
+    /* Mode list is not released: no node ever passed it (580.178.04 refuses memory lists), and its safety
      * rests on the ledger's pid check alone. The candidate path keeps it, so a node can still validate it. */
     if (!heap_mode() && !cfg.candidate) {
         say(why, sizeof why, "mode list is not released in " ATTICD_VERSION ": it has never passed on a node "
@@ -782,7 +796,7 @@ static void recheck(void)
     } else if (!st.ready) {
         char conn[256];
         if (st.display_block) {
-            /* The held display verdict stands (B3-R-OSCILLATION): SIGHUP does not re-derive it from one
+            /* The held display verdict stands: SIGHUP does not re-derive it from one
              * instant; display_watch's idle streak lifts it. */
             snprintf(st.why, sizeof st.why, "%s", st.dwhy[0] ? st.dwhy : "a display is in use");
         } else if (display_in_use(conn, sizeof conn, 1) > 0) {
@@ -805,7 +819,7 @@ static void recheck(void)
  * the samples are sparser than this 2 s tick: the modeset pass covers at most 256 proc entries (the
  * holder is found only on the ticks whose pass reaches it) and pmon runs every 30 s, so re-deriving
  * the verdict per tick let borrows through on the idle-reading ticks while the desktop was up all
- * along (B3-R-OSCILLATION: 12 of 20 borrows succeeded on a real GB10). The verdict is therefore held:
+ * along (12 of 20 borrows succeeded on a real GB10). The verdict is therefore held:
  * a display seen in use keeps new lends refused continuously - the idle-reading ticks change nothing -
  * and the block lifts only after DISPLAY_HOLD_TICKS ticks in a row whose readable signals all read
  * idle. One stopped line when the block engages, one again line when it lifts; the ticks between log
@@ -1068,7 +1082,7 @@ static int op_alloc(struct client *c, const struct attic_req *r)
     reap();
     /* The display verdict is held by the tick (display_watch): a desktop that starts between ticks
      * stops new lends within one tick, and while it is up the block does not oscillate with the
-     * samples (B3-R-OSCILLATION). No scan here - the modeset holder probe walks every proc fd dir,
+     * samples. No scan here - the modeset holder probe walks every proc fd dir,
      * and an alloc must answer in well under the client's timeout. */
     if (st.display_block)
         return refuse(c, st.dwhy[0] ? st.dwhy : "a display is in use: atticd lends the memory a display needs");
@@ -1088,7 +1102,14 @@ static int op_alloc(struct client *c, const struct attic_req *r)
             return refuse(c, w);
         }
     } else {
-        uint32_t n = (uint32_t)(size / ATTIC_SLICE);
+        /* count the slices in 64 bits and compare with the ledger before the cut to 32 bits: an alloc bigger
+         * than the whole range refuses here, it does not lend a run it names wrongly */
+        uint64_t n64 = size / ATTIC_SLICE;
+        if (n64 > st.ledger.count) {
+            say(w, sizeof w, "no free run of %llu MiB (largest %llu MiB)", MiB(size), MiB(largest));
+            return refuse(c, w);
+        }
+        uint32_t n = (uint32_t)n64;
         first = ledger_fit(&st.ledger, n);
         if (first < 0) {
             say(w, sizeof w, "no free run of %llu MiB (largest %llu MiB)", MiB(size), MiB(largest));
@@ -1203,6 +1224,7 @@ static int serve(struct client *c)
     if (r == 0)
         return -1;
     buf[r] = 0;
+    c->said = 1;
     struct attic_req q;
     if (m.msg_flags & MSG_TRUNC) {
         say(why, sizeof why, "request longer than %d bytes", ATTIC_REQUEST_MAX);
@@ -1254,6 +1276,7 @@ static void accept_all(int lfd)
         c->fd = fd;
         c->uid = cred.uid;
         c->who = attic_holder(cred.pid);
+        c->since = time(NULL);
         struct epoll_event ev = {.events = EPOLLIN | EPOLLRDHUP, .data.ptr = c};
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
             free(c);
@@ -1565,7 +1588,7 @@ int main(int argc, char **argv)
 
     for (int running = 1; running;) {
         struct epoll_event evs[32];
-        int n = epoll_wait(epfd, evs, 32, -1);
+        int n = epoll_wait(epfd, evs, 32, 1000); /* wake between events so the sweep can run */
         if (n < 0 && errno == EINTR)
             continue;
         for (int i = 0; i < n; i++) {
@@ -1608,7 +1631,13 @@ int main(int argc, char **argv)
                     drop(c, "hung up");
             }
         }
-        publish();
+        for (int i = st.nclients - 1; i >= 0; i--) { /* backwards: drop() swaps the last client into slot i */
+            struct client *c = st.clients[i];
+            if (!c->said && time(NULL) - c->since >= HANDSHAKE_S)
+                drop(c, "connected but never spoke");
+        }
+        if (n > 0)
+            publish();
     }
     LOGI("stopping: %d clients", st.nclients);
     while (st.nclients > 0)

@@ -575,6 +575,45 @@ def case_kv_v3(rig):
     check(inf and inf["free"] == 62 * MIB, "closed: all given back: %r" % inf)
 
 
+UTILS_SMALL_FIRST = '''import torch
+
+
+def allocate_kv_cache(kv_cache_config, device, layout, kernel_block_sizes=None):
+    scratch = torch.zeros(1024 * 1024, dtype=torch.int8, device=device)
+    sizes = {t.size for t in kv_cache_config.kv_cache_tensors}
+    assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
+    buf = torch.zeros(sizes.pop(), dtype=torch.int8, device=device)
+    return {"layer.0": buf}
+'''
+
+
+def case_kv_v3_small_first(rig):
+    """A small scratch allocation before the real backing must not be taken for the backing: the
+    handed tensor would stand in for one MiB of bookkeeping while the cache's real backing lands in
+    device memory - the carveout lent, unused, and the status claiming it holds the KV cache. The
+    first torch.zeros is the backing only when it covers the whole cache the config declares."""
+    rig.start(env=SMALL)
+    files = tree32()
+    files["vllm/v1/worker/utils.py"] = UTILS_SMALL_FIRST
+    v = Vllm(env_for(rig), files)
+    try:
+        w = v.worker(v.r1.GPUModelRunner(Device("cuda:0")), 100 * MIB)
+        check(w.determine_available_memory() == 162 * MIB, "budget raised, carveout lent")
+        raised = None
+        try:
+            w.model_runner.initialize_kv_cache_tensors(v.config32(140 * MIB), [16])
+        except Exception as e:
+            raised = e
+        check(raised is not None, "the placement refuses the scratch-first engine: %r" % raised)
+        check(LOGS.has("smaller than the KV cache"),
+              "one line says the first allocation was too small: %r" % [l for l in LOGS.lines])
+        check(not vllm_plugin.S.keep, "no carveout mapping is kept")
+        inf = wait_free(rig.sock, 62 * MIB)
+        check(inf and inf["free"] == 62 * MIB, "the unused carveout went back at once: %r" % inf)
+    finally:
+        v.done()
+
+
 def case_s2_v1(rig):
     """The budget was raised and the placement then fails: the engine stops, it never allocates the raise."""
     rig.start(env=SMALL)
@@ -728,6 +767,7 @@ def case_upstream(rig):
 
 
 CASES = [case_tail_plan, case_settings, case_entry_point, case_after_import, case_kv_v2, case_kv_v1_packed,
+                  case_kv_v3_small_first,
          case_kv_v3, case_weights, case_weights_and_kv, case_fail_open, case_blocked, case_drift, case_s2_v1,
          case_s2_v3, case_upstream]
 

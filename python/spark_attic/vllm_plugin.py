@@ -12,8 +12,8 @@ fill the KV cache as their modules load, in the processes that load them.
 
 There is no pinned vLLM version. The plugin knows two shapes of vLLM's KV allocation and, in each worker process,
 picks the one the running engine really has, by what its modules expose (the tables below; tests/test_vllm_plugin.py
-proves each shape against vLLM's own source for every supported release, and scripts/attic-engine-drift.sh runs that
-test against the newest release tags):
+proves each shape against vLLM's own source for every supported release; the plugin tests run against the
+newest release tags):
 
   0.24: Worker.determine_available_memory raises the KV budget; GPUModelRunner._allocate_kv_cache_tensors (V1) and
         attn_utils._allocate_kv_cache (V2) place the last KV tensors in the carveout. KVCacheTensor carries
@@ -517,6 +517,9 @@ def _make_alloc_v3(orig):
                         miss[0] = "the backing allocation lands on %s, not %s" % (where, device)
                     elif dtype != torch.int8:
                         miss[0] = "the backing allocation is %s, not int8" % dtype
+                    elif n * dtype.itemsize < size:
+                        miss[0] = ("the first allocation is %d MiB, smaller than the KV cache's %d MiB: "
+                                   "it is not the backing" % (n * dtype.itemsize // MIB, size // MIB))
                     else:
                         t = m.tensor(torch.int8, shape=(n,), nbytes=n)
                         handed.append(t)

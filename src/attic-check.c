@@ -41,7 +41,11 @@
 #include "attic.h"
 #include "proto.h"
 
-#define CHECK_VERSION "0.1.0"
+/* the version comes from the Makefile (ATTIC_VERSION); the fallback keeps a bare cc build honest */
+#ifndef ATTIC_VERSION_STR
+#define ATTIC_VERSION_STR "0.1.1"
+#endif
+#define CHECK_VERSION ATTIC_VERSION_STR
 #define CHUNK (64ull << 20)
 #define MiB(x) ((unsigned long long)((x) >> 20))
 
@@ -621,7 +625,7 @@ static int run_child(const char *phase, char *res, size_t cap)
     pid_t pid = fork();
     if (pid == 0) {
         dup2(p[1], 1);
-        setenv("ATTIC_CHECK_KEY", key, 1); /* the key off the command line: /proc/<pid>/cmdline is world-readable (M3) */
+        setenv("ATTIC_CHECK_KEY", key, 1); /* the key off the command line: /proc/<pid>/cmdline is world-readable */
         char *argv[] = {"attic-check", "--phase", (char *)phase, "--socket", (char *)sock_path,
                         "--mode", (char *)mode, "--iomem", (char *)iomem, "--meminfo", (char *)meminfo, NULL};
         execv("/proc/self/exe", argv);
@@ -650,7 +654,7 @@ static pid_t start_holder(int close_first, char *line, size_t cap)
     pid_t pid = fork();
     if (pid == 0) {
         dup2(p[1], 1);
-        setenv("ATTIC_CHECK_KEY", key, 1); /* the key off the command line (M3) */
+        setenv("ATTIC_CHECK_KEY", key, 1); /* the key off the command line */
         char *argv[] = {"attic-check", "--phase", close_first ? "hold-close" : "hold", "--socket", (char *)sock_path,
                         NULL};
         execv("/proc/self/exe", argv);
@@ -742,9 +746,9 @@ static int phase_refusal(void)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: attic-check [--socket PATH] [--key KEY] [--mode heap|list] [--report FILE] [--device N]\n"
-                    "                   [--iomem PATH] [--meminfo PATH]\n"
-                    "       attic-check --status [--socket PATH] [--key KEY]   (print atticd's status)\n");
+    fprintf(stderr, "usage: attic-check [--socket PATH] [--key KEY | --key-file PATH] [--mode heap|list] [--report FILE]\n"
+                    "                   [--device N] [--iomem PATH] [--meminfo PATH]\n"
+                    "       attic-check --status [--socket PATH] [--key KEY | --key-file PATH]   (print atticd's status)\n");
 }
 
 int main(int argc, char **argv)
@@ -778,7 +782,7 @@ int main(int argc, char **argv)
         }
     }
     if (key[0] == 0) {
-        const char *e = getenv("ATTIC_CHECK_KEY"); /* how run_child hands the key to its phase children (M3) */
+        const char *e = getenv("ATTIC_CHECK_KEY"); /* how run_child hands the key to its phase children */
         if (e != NULL && e[0] != 0)
             key = e;
     }

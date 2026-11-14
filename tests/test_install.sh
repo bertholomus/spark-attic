@@ -98,19 +98,21 @@ mkartifact() { # $1 = artifact dir, $2 = version: what build-release.sh lays dow
   } >"$A/artifacts/$DRIVER/BUILD-INFO"
   cp "$HERE/scripts/attic-validate.sh" "$A/scripts/"
   cp "$HERE/install.sh" "$A/install.sh"
-  sed "s/^VERSION=\${INSTALL_VERSION:-0.1.0}/VERSION=\${INSTALL_VERSION:-$V}/" "$A/install.sh" >"$A/install.sh.new"
+  sed "s/^VERSION=\${INSTALL_VERSION:-[0-9.]*/VERSION=\${INSTALL_VERSION:-$V/" "$A/install.sh" >"$A/install.sh.new"
   mv "$A/install.sh.new" "$A/install.sh" && chmod 755 "$A/install.sh"
   cp "$HERE/systemd/attic.service" "$A/systemd/"
   cp "$HERE/sysctl/99-spark-attic-minfree.conf" "$A/sysctl/"
-  cp "$HERE/share/spark-attic/header-art.txt" "$HERE/share/spark-attic/header-col.txt" "$A/share/"
+  # an exported tree carries no art until the graphics gate approves it; the installer treats art as optional
+  [ -f "$HERE/share/spark-attic/header-art.txt" ] &&
+    cp "$HERE/share/spark-attic/header-art.txt" "$HERE/share/spark-attic/header-col.txt" "$A/share/"
   # the working tree keeps the docs under release/; the exported tree keeps them at its root
   DOC=$HERE/release/README.md
   [ -f "$DOC" ] || DOC=$HERE/README.md
   DOCI=$HERE/release/INSTALL.md
   [ -f "$DOCI" ] || DOCI=$HERE/INSTALL.md
   cp "$DOC" "$DOCI" "$HERE/STATUS-FILE.md" "$A/share/"
-  RELEASE_NOTES=$HERE/release/RELEASE-NOTES-0.1.0.md
-  [ -f "$RELEASE_NOTES" ] || RELEASE_NOTES=$HERE/RELEASE-NOTES-0.1.0.md
+  RELEASE_NOTES=$HERE/release/RELEASE-NOTES-0.1.1.md
+  [ -f "$RELEASE_NOTES" ] || RELEASE_NOTES=$HERE/RELEASE-NOTES-0.1.1.md
   cp "$RELEASE_NOTES" "$A/share/"
   cp "$HERE/LICENSE-MIT" "$HERE/LICENSE-APACHE" "$A/share/"
   printf 'third-party notices (test)\n' >"$A/share/THIRD_PARTY_NOTICES"
@@ -180,6 +182,22 @@ rc=$?
 [ $rc = 1 ] && grep -q "no NVIDIA driver is loaded" "$R/out"
 ok $? "no driver: exit 1 with the sentence (rc $rc)"
 
+R=$T/pf-libcuda; mknode "$R"; instenv "$R"
+ATTIC_LIBCUDA=absent bash "$A/install.sh" --check --from "$A" --root "$R" >"$R/out" 2>&1
+rc=$?
+[ $rc = 1 ] && grep -q "no libcuda.so.1 on this host" "$R/out"
+ok $? "no driver library: exit 1, the sentence names libcuda (rc $rc)"
+
+R=$T/pf-libcuda-ok; mknode "$R"; instenv "$R"
+ATTIC_LIBCUDA=present bash "$A/install.sh" --check --from "$A" --root "$R" >"$R/out" 2>&1
+grep -q "the driver library is there" "$R/out"
+ok $? "the driver library present: the preflight says so"
+
+R=$T/pf-help; mknode "$R"; instenv "$R"
+cat "$A/install.sh" | bash -s -- --help >"$R/hout" 2>&1
+[ $? = 2 ] && grep -q "GB10 node, one command" "$R/hout"
+ok $? "piped --help: the usage, not bash's source"
+
 R=$T/pf-systemd; mknode "$R"; instenv "$R"
 rm -rf "$R/run/systemd/system"
 bash "$A/install.sh" --check --from "$A" --root "$R" >"$R/out" 2>&1
@@ -216,7 +234,7 @@ echo "fake 1000000 999000 100 100% $2"
 EOF
 chmod 755 "$R/.fakebin/df"
 bash "$A/install.sh" --check --from "$A" --root "$R" >"$R/out" 2>&1
-[ $? = 1 ] && grep -q "MiB free at .*: spark-attic needs about 10 MiB" "$R/out"
+[ $? = 1 ] && grep -q "MiB free at .*: spark-attic needs 64 MiB" "$R/out"
 ok $? "no disk space: exit 1 with the sentence"
 
 R=$T/pf-good; mknode "$R"; instenv "$R"
@@ -324,6 +342,23 @@ ok $? "the header names the product and the version"
 [ -f "$R/var/log/spark-attic/install.log" ] && grep -q "validate exit 0" "$R/var/log/spark-attic/install.log"
 ok $? "the log records the steps"
 
+# ---------------------------------------------------------------- 3d. the old manual-path attic-check
+# INSTALL.md before 0.1.1 taught `install -m 0755 bin/attic-check /usr/local/bin/attic-check`;
+# install.sh puts it in /usr/local/sbin. An installer run over such a manual install must remove
+# the stale copy so the sbin one is the only attic-check on the node.
+echo "test_install: the old manual-path attic-check"
+R=$T/in-oldbin; mknode "$R"; instenv "$R"
+mkdir -p "$R/usr/local/bin"
+printf "#!/bin/sh\nexit 0\n" >"$R/usr/local/bin/attic-check"
+chmod 755 "$R/usr/local/bin/attic-check"
+bash "$A/install.sh" --from "$A" --root "$R" >"$R/out-oldbin" 2>&1
+rc=$?
+[ $rc = 0 ]
+ok $? "install exit 0 with a stale manual-path attic-check (rc $rc)"
+[ ! -e "$R/usr/local/bin/attic-check" ] && [ -x "$R/usr/local/sbin/attic-check" ]
+ok $? "the stale /usr/local/bin/attic-check is gone, the sbin one is in place"
+unset_environ
+
 # ---------------------------------------------------------------- 3e. doctor uses the installed artifact
 # doctor called install.sh --check with no artifact, so a healthy node printed two "no artifact yet"
 # warnings for the shim and the display. With the installed atticd and /var/lib/attic/artifacts/<driver>
@@ -349,8 +384,8 @@ R=$T/inrel; mknode "$R"; instenv "$R"
 bash "$A/install.sh" --from "$T/spark-attic-0.1.0-aarch64.tar.gz" --root "$R" >"$R/out" 2>&1
 rc=$?
 [ $rc = 0 ] || { sed -n 1,40p "$R/out"; }
-[ $rc = 0 ] && [ -f "$R/usr/local/share/spark-attic/README.md" ] && [ -f "$R/usr/local/share/spark-attic/header-art.txt" ]
-ok $? "a tarball with share/spark-attic/ installs, docs and art in place (rc $rc)"
+[ $rc = 0 ] && [ -f "$R/usr/local/share/spark-attic/README.md" ] && { [ ! -f "$A/share/header-art.txt" ] || [ -f "$R/usr/local/share/spark-attic/header-art.txt" ]; }
+ok $? "a tarball with share/spark-attic/ installs, the docs in place, art when the tree has it (rc $rc)"
 bash "$A/install.sh" --from "$T/spark-attic-0.1.0-aarch64.tar.gz" --root "$R" >"$R/out2" 2>&1
 grep -q "already installed: nothing to do" "$R/out2"
 ok $? "the same tarball again: nothing to do"
@@ -578,11 +613,33 @@ NO_COLOR=1 bash "$A/install.sh" --from "$A" --root "$R" >"$R/outp" 2>&1
 ok $? "NO_COLOR: no escapes in the output"
 [ "$(head -n1 "$R/outp")" = "spark-attic 0.1.0" ]
 ok $? "NO_COLOR: the header is the plain text line"
+grep -q -e "✓" -e "✗" -e "·" -e "—" "$R/outp"; [ $? = 1 ]
+ok $? "NO_COLOR: no glyph bullets in the steps"
 unset_environ
 R=$T/plain2; mknode "$R"; instenv "$R"
 bash "$A/install.sh" --from "$A" --root "$R" --plain >"$R/outpp" 2>&1
 ! grep -q $'\033' "$R/outpp"
 ok $? "--plain: no escapes either"
+unset_environ
+R=$T/plain3; mknode "$R"; instenv "$R"
+ATTIC_COLOR=always bash "$A/install.sh" --from "$A" --root "$R" --plain >"$R/outpp3" 2>&1
+! grep -q $'\033' "$R/outpp3"
+ok $? "--plain beats ATTIC_COLOR=always: no escapes"
+unset_environ
+
+echo "test_install: a finished or failed install leaves no temporary directories"
+R=$T/tmpclean; mknode "$R"; instenv "$R"
+TT=$(mktemp -d "$T/tmpclean.XXXXXX")
+TMPDIR="$TT" bash "$A/install.sh" --from "$A" --root "$R" >"$R/outtmp" 2>&1
+ok $? "the install itself succeeds"
+[ -z "$(find "$TT" -mindepth 1 -print -quit)" ]
+ok $? "nothing left in TMPDIR after a successful install"
+unset_environ
+R=$T/tmpfail; mknode "$R"; instenv "$R"
+TT2=$(mktemp -d "$T/tmpfail.XXXXXX")
+TMPDIR="$TT2" bash "$A/install.sh" --from "$T/does-not-exist" --root "$R" >"$R/outtmp2" 2>&1 || true
+[ -z "$(find "$TT2" -mindepth 1 -print -quit)" ]
+ok $? "nothing left in TMPDIR after a failed install"
 unset_environ
 R=$T/colour; mknode "$R"; instenv "$R"
 env -u NO_COLOR ATTIC_COLOR=always TERM=xterm-256color bash "$A/install.sh" --from "$A" --root "$R" \

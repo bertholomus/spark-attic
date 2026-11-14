@@ -68,7 +68,7 @@ Clients speak one small protocol over a Unix socket (`/run/spark-attic/attic.soc
 `/etc/spark-attic/key`). A keyless status file, `/run/spark-attic/status.json`, tells dashboards what is lent
 ([STATUS-FILE.md](STATUS-FILE.md)).
 
-A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.0: it has never
+A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.1: it has never
 passed a node check (on 580.178.04 RM uses part of the region, so the check refuses list mode there), and atticd
 will not run in it until a driver validates it.
 
@@ -83,7 +83,7 @@ will not run in it until a driver validates it.
 | vLLM | 0.24.0, 0.31.0 and 0.32.0 (NGC 26.07 ships 0.24.0, 26.10 ships 0.31.0; the plugins' upstream-source check passes on 0.24.0, 0.32.0 and 0.33.0rc3): the V1 and V2 GPU model runners, without sleep mode or a KV connector. On any other vLLM the KV placement turns itself off with one log line and the KV budget stays as vLLM measured it. |
 | SGLang | 0.5.14, 0.5.21 and 0.5.23 (NGC `nvcr.io/nvidia/sglang:26.07-py3` ships 0.5.14; `:26.10-py3` ships 0.5.21). The buffers hook reads the buffer layout from the pool's own `_create_buffers` before the KV budget is raised - separate K and V allocations (0.5.14, 0.5.21) or 0.5.22+'s fused (2, padded, H, D) one - and a pattern it cannot read keeps the KV placement off before anything is raised. The standard MHA KV pool (not MLA, sliding window, Mamba, FP4 KV, memory saver, PD disaggregation or speculative decoding). On any other SGLang the KV placement turns itself off with one log line, the same. |
 
-A hook that fails at server start on a shape the plugin knows crashes the server (S2's rule: the budget was
+A hook that fails at server start on a shape the plugin knows crashes the server: the budget was
 about to be raised, so a silent fallback would allocate the raise in device memory behind the engine's back);
 `attic-preflight.py` exercises the same write the hooks do, so this case is caught before the server starts.
 Placement errors detected while the plugin registers (a source that fits no shape, a write the runtime context
@@ -129,7 +129,7 @@ temperature 0, 8 fixed prompts, the same pinned KV budget of 150,000 tokens in e
 
 `kv` adds 18,688 tokens, all 2,044 MiB atticd lent.
 
-**vLLM 0.31.0, node window 2** (NGC `nvcr.io/nvidia/vllm:26.10-py3`, the `kv` placement, 2026-11-11, an ASUS Ascent GX10 with the same driver, the same pinned 150,000-token budget; every number here is from the window-2 log, `fleet/spark-attic-review-1110/node-1110/WINDOW-2-LOG.md`): kv replies identical 8/8 with the KV pool at 168,688 tokens = base + 18,688 (+2,044.0 MiB, exactly what atticd lent), weights replies identical 8/8 with embed_tokens (594 MiB) in the carveout, off2 identical 8/8, decode within 1.4% of baseline.
+**vLLM 0.31.0, node** (NGC `nvcr.io/nvidia/vllm:26.10-py3`, the `kv` placement, 2026-11-11, an ASUS Ascent GX10 with the same driver, the same pinned 150,000-token budget; every number here is from that run's log): kv replies identical 8/8 with the KV pool at 168,688 tokens = base + 18,688 (+2,044.0 MiB, exactly what atticd lent), weights replies identical 8/8 with embed_tokens (594 MiB) in the carveout, off2 identical 8/8, decode within 1.4% of baseline.
 
 **Memory.** Idle MemAvailable on the same node, the median of 5 reads with no engine running: 119,737 MiB on the
 4 KiB-page kernel 7.0.0-1024-nvidia (DGX OS 7.5.0). On the 64 KiB-page kernel 7.0.0-1024-nvidia-64k, 108,209 MiB as
@@ -166,7 +166,7 @@ default because it adds the whole carveout. The script that made this table is `
 One command on the node, as root (INSTALL.md has the details, and the manual path):
 
 ```
-curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.0/install.sh | sudo bash
+curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.1/install.sh | sudo bash
 ```
 
 The installer checks the node first (aarch64 GB10, root, systemd, the driver, a shim for that

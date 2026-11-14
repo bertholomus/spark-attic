@@ -26,15 +26,15 @@ INC=(-isystem "$NV/src/common/sdk/nvidia/inc" -isystem "$NV/kernel-open/common/i
   -isystem "$NV/src/nvidia/arch/nvalloc/unix/include")
 # The compiler canonicalizes header paths, so a cache reached through a symlink (the tests link
 # the export's cache/ at the tag cache) would write the real path into the debug info under the
-# $HERE map's radar: map the resolved nvidia-cache directory as well (REVIEW-1112 finding 1).
+# $HERE map's radar: map the resolved nvidia-cache directory as well.
 NVREAL=$(cd "$NV" && pwd)
 NVROOT=${NVREAL%/nvidia/*}
 # The carveout region types this driver's header names (the enum is renumbered between drivers: carveout_kind.h).
 TYPES=$("$HERE/scripts/attic-carveout-types.sh" "$ZIG" cc -target "$TARGET" -std=gnu11 "${INC[@]}")
 # NVIDIA's headers as system headers: their own warnings are theirs; ours fail the build.
 # -ffile-prefix-map: the shim carries no build path - not this tree's, not the zig toolchain's own include
-# directories, which ride in through glibc's headers' debug info (M4, KIT.md step 3), not the resolved
-# nvidia-cache path when the cache is reached through a symlink (REVIEW-1112 finding 1). The compile
+# directories, which ride in through glibc's headers' debug info, not the resolved
+# nvidia-cache path when the cache is reached through a symlink. The compile
 # itself runs from $HERE: the compiler records its working directory in the debug info, and a caller
 # in another tree would write that tree's path in under every map's radar.
 (cd "$HERE" && "$ZIG" cc -target "$TARGET" -std=gnu11 -O2 -g -Wall -Wextra -Werror -fPIC -shared -fvisibility=hidden \

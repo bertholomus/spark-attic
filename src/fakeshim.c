@@ -34,7 +34,7 @@
 struct block {
     int used, ram, released; /* released: atticd let go, a process still refers to its memfd */
     int mfd;                 /* the block's own memfd, open for the block's lifetime: re-exporting the slice
-                              * hands out the same memory, with the previous holder's bytes still in it (S3) */
+                              * hands out the same memory, with the previous holder's bytes still in it */
     uint64_t first, n, size;
     char name[48]; /* the memfd exported for it */
 };
@@ -157,7 +157,7 @@ static int referenced(const char *name)
         if (e->d_name[0] < '0' || e->d_name[0] > '9')
             continue;
         if ((pid_t)atoi(e->d_name) == getpid())
-            continue; /* our own master memfds say nothing about a client (S3) */
+            continue; /* our own master memfds say nothing about a client */
         char path[300], line[600];
         snprintf(path, sizeof path, "/proc/%s/maps", e->d_name);
         FILE *f = fopen(path, "r");

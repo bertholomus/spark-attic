@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright 2026 bertholomus
+# spark-attic CI: the host tests, on both runner architectures. No GPU, no NVIDIA driver, no
+# root, no zig (make check builds and tests everything with the system compiler), and no
+# upstream engine clones (the plugins' source-check cases skip themselves when cache/upstream/
+# is empty, which is always true here: the cache is not in the tree).
+# What a GB10 node proves - the measured numbers in README.md (Tested) - is outside CI's reach;
+# the release build with its reproducibility check needs the NVIDIA tag
+# cache, so it runs where that cache lives, not on a runner.
+# Written for the spark-attic repository; not run anywhere until this file is pushed.
+
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: make check (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential python3 file
+          python3 --version
+      - name: Build and run the host tests
+        run: make check
