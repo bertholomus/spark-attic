@@ -10,7 +10,8 @@ no build step.
 
 borrow() and Pool.borrow_or_none() fail open: no atticd, nothing free, or a failed step gives None and one log line
 (logger "spark_attic"), never an exception. The memory stays lent until the Mapping is closed or the process exits.
-Settings: SPARK_ATTIC_SOCK (/run/spark-attic/attic.sock), SPARK_ATTIC_KEY or SPARK_ATTIC_KEY_FILE, SPARK_ATTIC_TIMEOUT_MS.
+A borrow() comes back zeroed: atticd hands a slice on with whatever its previous holder left in it.
+Settings: SPARK_ATTIC_SOCK (/run/spark-attic/attic.sock), SPARK_ATTIC_KEY or SPARK_ATTIC_KEY_FILE (no key is compiled in), SPARK_ATTIC_TIMEOUT_MS.
 """
 import logging
 import os
@@ -19,11 +20,11 @@ import weakref
 
 from . import _cuda
 from ._cuda import CudaError
-from ._proto import DEFAULT_KEY, DEFAULT_SOCK, SLICE, Attic, AtticError, Settings, key_ok
+from ._proto import DEFAULT_SOCK, SLICE, Attic, AtticError, Settings, key_ok
 
 __version__ = "0.1.0"
 __all__ = ["Attic", "AtticError", "CudaError", "Lent", "Mapping", "Pool", "Settings", "borrow", "info", "SLICE",
-           "DEFAULT_SOCK", "DEFAULT_KEY", "key_ok"]
+           "DEFAULT_SOCK", "key_ok"]
 log = logging.getLogger("spark_attic")
 MIB = 1 << 20
 
@@ -199,12 +200,19 @@ class Pool:
         return Mapping(self.device, va, parts, self.attic if owns_attic else None)
 
     def borrow(self, nbytes=None):
-        """nbytes (rounded up to 2 MiB; default the largest free run) of display carveout as one Mapping."""
+        """nbytes (rounded up to 2 MiB; default the largest free run) of display carveout as one Mapping, zeroed:
+        atticd hands a slice on with whatever its previous holder left in it, and the documented API clears it."""
         if nbytes is None:
             nbytes = self.info()["largest"]
             if nbytes <= 0:
                 raise AtticError("atticd has nothing free")
-        return self.map(0, [_round_up(nbytes, SLICE)])
+        m = self.map(0, [_round_up(nbytes, SLICE)])
+        try:
+            m.zero()
+        except Exception:
+            m.close()
+            raise
+        return m
 
     def borrow_or_none(self, nbytes=None):
         try:
@@ -237,6 +245,11 @@ def borrow(nbytes=None, device=None, settings=None):
             if nbytes <= 0:
                 raise AtticError("atticd has nothing free")
         m = pool.map(0, [_round_up(nbytes, SLICE)], owns_attic=True)
+        try:
+            m.zero()  # atticd hands a slice on with the previous holder'"'"'s bytes in it; the API clears them
+        except Exception:
+            m.close()
+            raise
         log.info("spark-attic: %d MiB of display carveout at 0x%x on cuda:%d", m.size // MIB, m.ptr, m.device)
         return m
     except (AtticError, CudaError, OSError) as e:

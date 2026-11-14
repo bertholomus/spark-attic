@@ -2,10 +2,24 @@
 
 **More memory for CUDA on an NVIDIA GB10: lend it the display carveout.**
 
-The NVIDIA driver sets aside about 2 GiB of a GB10's memory for a display. A headless DGX Spark-class box never
-drives one, and that memory lies outside the kernel's System RAM, so MemAvailable never counts it. spark-attic's
-`atticd`, a small root daemon, lends it to CUDA programs as ordinary device memory, in 2 MiB slices. An inference
-engine's KV cache gets about 2 GiB more without giving up any other memory.
+The NVIDIA driver sets aside about 2 GiB of a GB10's memory for a display. On a box that is not driving a display
+that memory lies outside the kernel's System RAM, so MemAvailable never counts it. spark-attic's `atticd`, a small
+root daemon, lends it to CUDA programs as ordinary device memory, in 2 MiB slices. An inference engine's KV cache
+gets about 2 GiB more without giving up any other memory.
+
+`atticd` lends nothing while a display is in use, and it re-checks the signals every 2 s; a borrow request
+consults the verdict without scanning anything. A display is in use when any of these holds: a process other
+than `nvidia-persistenced` holds `/dev/nvidia-modeset`; the GPU lists a graphics (type G) process; a DRM
+connector reports `connected` (that last one is the KMS systems; stock DGX OS runs with `nvidia-drm modeset=0`
+and has no connector state at all, so the first two carry the verdict there). `nvidia-persistenced` holding
+the device open is the idle state - it keeps the driver loaded, it does not light anything up. The verdict is
+held, not re-derived from each tick's own instant: the signals are read on their own cadence (the modeset
+scan walks at most 256 process dirs a tick, the pmon sample runs every 30 s), so once a display is seen in
+use, lending stays blocked continuously while it is up, and the block lifts only after several ticks in a
+row (about 6 s) whose readings all say idle. `atticd --probe-display` prints one line per signal, read-only,
+and exits 1 when any fires. Limit: our test runs against an emulated head (the readings came from a headless
+node and a desktop session on one); a real driven monitor has not been proven, and `atticd` errs on the side
+of lending nothing.
 
 - **Measured, not assumed.** On stock DGX OS, in vLLM and in TensorFold, the KV cache grows by what atticd lends,
   replies stay identical at temperature 0, and decode speed stays within run-to-run noise. SGLang does the same in
@@ -17,9 +31,29 @@ engine's KV cache gets about 2 GiB more without giving up any other memory.
 - **Nothing to flash or reboot.** No firmware setting, no kernel module, no kernel patch. A process borrows, and
   the memory comes back when the process lets go or exits.
 - **Works with what you run.** A vLLM plugin and an SGLang hook (installed, not patched in), a pure-Python client,
-  and a carveout source for TensorFold (proposed to TensorFold, not in a TensorFold release yet).
+  and a carveout source for TensorFold (open upstream as TensorFold #2762 and #2763, not in a TensorFold release yet).
 
-> Pre-release. v0.1.0 is not tagged yet. Headless boxes only: see Supported.
+**One lender at a time.** Two lenders of the same carveout would fight over RM's heap, so the
+installer refuses to run while another one is listening. It checks the sockets named in
+`ATTIC_OTHER_SOCKETS` (a list of Unix-socket paths); set it before the install if your node runs a
+lender whose socket is not the one the installer knows about. An empty list means nothing else to
+check, and the install says so in one line (a warn, not a pass).
+
+> Headless boxes are the tested case: atticd refuses to lend while a display is connected (see Supported).
+One limit to know: atticd re-checks the display before every new lend, not mid-lend. Memory lent
+before a display starts stays lent until its holder exits; the display waits, or uses what RM still
+holds, until then. New engines that start later get nothing while the display is up.
+
+**Where the numbers come from.** Everything marked *measured* below was measured on a GB10 node
+(ASUS Ascent GX10, stock DGX OS) with the release binaries. The engine-version claims are wider:
+the plugins are exercised on the node for the versions listed, and checked against further upstream
+releases by reading those releases' source on the build host (the drift test) - a source check proves
+the code shape, not a run. A release note that says only *source-checked* has never run on a node.
+
+A release is three files: `spark-attic-VERSION-aarch64.tar.gz`, its `.sha256`, and a standalone
+`install.sh` with the tarball's sha256 stamped in - the last is what a `curl | bash` run gets, so it
+can verify the tarball it downloads with nothing else on disk.
+
 
 ## How it works
 
@@ -34,19 +68,27 @@ Clients speak one small protocol over a Unix socket (`/run/spark-attic/attic.soc
 `/etc/spark-attic/key`). A keyless status file, `/run/spark-attic/status.json`, tells dashboards what is lent
 ([STATUS-FILE.md](STATUS-FILE.md)).
 
-A second mode, **list**, lends the region's physical pages directly. On 580.178.04 RM uses part of the region, so
-the node check refuses list mode there, and atticd will not run in it.
+A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.0: it has never
+passed a node check (on 580.178.04 RM uses part of the region, so the check refuses list mode there), and atticd
+will not run in it until a driver validates it.
 
 ## Supported
 
 | | |
 |---|---|
 | Hardware | NVIDIA GB10. Tested on an ASUS Ascent GX10. NVIDIA's own DGX Spark uses the same chip, driver and DGX OS; not tested on one yet. |
-| Display | Headless only. No run so far had a display connected, and atticd does not check for one yet. Do not run it on a box that drives a monitor. |
-| OS | Linux aarch64 with systemd. Tested on DGX OS 7.6.0 (Ubuntu 24.04.5) with its kernels 7.0.0-1024-nvidia and 7.0.0-1024-nvidia-64k, and with kernel 7.0.0-1019-nvidia-64k. |
-| NVIDIA driver | 580.178.04: validated (heap). 580.196.07: builds cleanly, not yet validated on a node. Any other: atticd lends nothing until `attic-update.sh` builds and validates it. |
-| vLLM | 0.24.0 (NGC `nvcr.io/nvidia/vllm:26.07-py3`): the V1 and V2 GPU model runners, without sleep mode or a KV connector. Not vLLM 0.32.0 yet: the plugin's source check fails there and the KV placement stays off. |
-| SGLang | 0.5.14 (NGC `nvcr.io/nvidia/sglang:26.07-py3`): the standard MHA KV pool (not MLA, sliding window, Mamba, FP4 KV, memory saver, PD disaggregation or speculative decoding). Not SGLang 0.5.23 yet: the plugin's source check fails there and the KV placement stays off. |
+| Display | Headless boxes are the tested case. atticd re-checks three display signals every 2 s - a non-`nvidia-persistenced` holder of `/dev/nvidia-modeset`, a graphics (type G) process, a DRM connector reporting `connected` - and while any of them says a display is in use it lends nothing, says why in its log and status file, and holds that verdict until the readings say idle for a few seconds. Host-tested with fake signal trees, including intermittent ones; no node run has had a real desktop on it yet. |
+| OS | Linux aarch64 with systemd. Tested on DGX OS 7.6.0 (Ubuntu 24.04.5) with its kernels 7.0.0-1024-nvidia and 7.0.0-1024-nvidia-64k, and with kernel 7.0.0-1019-nvidia-64k. DGX OS now offers 7.0.0-1025; tested on 1024. |
+| NVIDIA driver | The release artifact ships a shim for 580.178.04, 580.196.07, 595.112.07, 615.71.09, 615.71.10, 615.78.08 and 620.70.06; none is trusted until a node checks it. 580.178.04 is validated on a node (heap mode). install.sh validates the driver your node runs before atticd lends anything and lends nothing if that check fails. Any other driver: atticd lends nothing until `attic-update.sh` builds and validates it. |
+| vLLM | 0.24.0, 0.31.0 and 0.32.0 (NGC 26.07 ships 0.24.0, 26.10 ships 0.31.0; the plugins' upstream-source check passes on 0.24.0, 0.32.0 and 0.33.0rc3): the V1 and V2 GPU model runners, without sleep mode or a KV connector. On any other vLLM the KV placement turns itself off with one log line and the KV budget stays as vLLM measured it. |
+| SGLang | 0.5.14, 0.5.21 and 0.5.23 (NGC `nvcr.io/nvidia/sglang:26.07-py3` ships 0.5.14; `:26.10-py3` ships 0.5.21). The buffers hook reads the buffer layout from the pool's own `_create_buffers` before the KV budget is raised - separate K and V allocations (0.5.14, 0.5.21) or 0.5.22+'s fused (2, padded, H, D) one - and a pattern it cannot read keeps the KV placement off before anything is raised. The standard MHA KV pool (not MLA, sliding window, Mamba, FP4 KV, memory saver, PD disaggregation or speculative decoding). On any other SGLang the KV placement turns itself off with one log line, the same. |
+
+A hook that fails at server start on a shape the plugin knows crashes the server (S2's rule: the budget was
+about to be raised, so a silent fallback would allocate the raise in device memory behind the engine's back);
+`attic-preflight.py` exercises the same write the hooks do, so this case is caught before the server starts.
+Placement errors detected while the plugin registers (a source that fits no shape, a write the runtime context
+refuses) turn the placement off with one log line instead: nothing was promised yet, so there is nothing to
+fail loudly about. |
 | Python | 3.9 or later, no dependencies (ctypes on `libcuda`); `torch` only for `.tensor()`. |
 
 Where a plugin does not know the layout, it stays off and the engine runs exactly as without it, with one log line.
@@ -58,7 +100,8 @@ installed as INSTALL.md says (attic.service, heap mode, validated). The arms of 
 boot, and KV pool sizes come from each engine's own log.
 
 **TensorFold, Qwen3.8 Flash Next** (bf16 KV, text only, a 262,144-token window, up to 5 streams). TensorFold `main`
-8db1ee1a with two patches that are not in a TensorFold release yet: the carveout source `TF_CUDA_CARVEOUT_SOURCE=attic`
+8db1ee1a with two of our patches, open upstream as TensorFold #2762 and #2763 and in no TensorFold release
+yet (the current release, 1.2.7, has neither): the carveout source `TF_CUDA_CARVEOUT_SOURCE=attic`
 and Flash Next's KV cache in the carveout. Replies: 8 prompts at temperature 0 and 3 seeded at temperature 1.0,
 compared by text, finish reason and token hash. Speeds in tokens per second: decode the median of 5 runs, prefill the
 best of 3.
@@ -86,10 +129,13 @@ temperature 0, 8 fixed prompts, the same pinned KV budget of 150,000 tokens in e
 
 `kv` adds 18,688 tokens, all 2,044 MiB atticd lent.
 
+**vLLM 0.31.0, node window 2** (NGC `nvcr.io/nvidia/vllm:26.10-py3`, the `kv` placement, 2026-11-11, an ASUS Ascent GX10 with the same driver, the same pinned 150,000-token budget; every number here is from the window-2 log, `fleet/spark-attic-review-1110/node-1110/WINDOW-2-LOG.md`): kv replies identical 8/8 with the KV pool at 168,688 tokens = base + 18,688 (+2,044.0 MiB, exactly what atticd lent), weights replies identical 8/8 with embed_tokens (594 MiB) in the carveout, off2 identical 8/8, decode within 1.4% of baseline.
+
 **Memory.** Idle MemAvailable on the same node, the median of 5 reads with no engine running: 119,737 MiB on the
 4 KiB-page kernel 7.0.0-1024-nvidia (DGX OS 7.5.0). On the 64 KiB-page kernel 7.0.0-1024-nvidia-64k, 108,209 MiB as
 DGX OS sets it up (7.5.0; on 7.6.0 the same kernel had 107,689 MiB available at boot) and 121,147 MiB with
-INSTALL.md's optional `vm.min_free_kbytes` file from boot (7.6.0).
+INSTALL.md's optional `vm.min_free_kbytes` file from boot (7.6.0) - the installer writes that file
+only with `--with-sysctl` (opt-in; section 3 of INSTALL.md).
 
 SGLang has not run on DGX OS yet; its numbers below are from kernel 7.0.0-1019-nvidia-64k.
 
@@ -117,28 +163,40 @@ default because it adds the whole carveout. The script that made this table is `
 
 ## Quick start
 
-Full steps, building from source and driver updates: [INSTALL.md](INSTALL.md).
+One command on the node, as root (INSTALL.md has the details, and the manual path):
 
 ```
-# on the node, as root, in the folder INSTALL.md section 2 stages
-install -m 0755 bin/atticd /usr/local/sbin/atticd
-install -m 0755 bin/attic-check /usr/local/bin/attic-check
-install -d -m 0755 /var/lib/attic /var/lib/attic/artifacts /etc/spark-attic
-(umask 077; od -An -N12 -tx1 /dev/urandom | tr -d ' \n' | sed 's/^/attic_/' > /etc/spark-attic/key)
-install -m 0644 systemd/attic.service /etc/systemd/system/attic.service
-systemctl daemon-reload
-scripts/attic-validate.sh artifacts/580.178.04        # checks this node's driver; enables only what passed
-systemctl enable --now attic.service
-cat /run/spark-attic/status.json                      # "state":"ready"
+curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.0/install.sh | sudo bash
 ```
 
-Then start your vLLM or SGLang container with atticd's socket, the key and the Python package (`python/` from the
-staged folder):
+The installer checks the node first (aarch64 GB10, root, systemd, the driver, a shim for that
+driver, no display in use, no other lender, disk), fetches the release tarball and verifies it
+against its SHA256SUMS, installs the files, makes the key root-only, validates the running
+driver and enables the service only if that passed. It is idempotent (a second run changes
+nothing), it rolls back if a step fails, and every step is logged to
+`/var/log/spark-attic/install.log`. `install.sh --check` runs only the checks; `--from
+<tarball>` installs an offline copy.
+
+See it before you run it: in a clone of this repo, `make demo` runs the same install flow against a
+simulated node in a throwaway directory and installs nothing (any Linux box with a C compiler; a Y/N
+confirm guards the install step; `bash install.sh --demo --fail display` shows a refusal path).
+
+Then:
+
+```
+spark-attic status      # state, MiB lent, clients, driver, validated
+spark-attic doctor      # every check with its fix; exit code = problems found
+```
+
+Full steps, building from source, driver updates: [INSTALL.md](INSTALL.md).
+
+Then start your vLLM or SGLang container with atticd's socket, the key and the Python package
+(the installed copy, `/usr/local/share/spark-attic/python`):
 
 ```
 docker run --gpus all --ipc=host \
   -v /run/spark-attic:/run/spark-attic -v /etc/spark-attic/key:/etc/spark-attic/key:ro \
-  -v /tmp/spark-attic/python:/opt/spark-attic/python:ro \
+  -v /usr/local/share/spark-attic/python:/opt/spark-attic/python:ro \
   -e PYTHONPATH=/opt/spark-attic/python -e SPARK_ATTIC_KEY_FILE=/etc/spark-attic/key \
   nvcr.io/nvidia/vllm:26.07-py3 vllm serve <model> ...
 ```
@@ -151,7 +209,7 @@ The plugin loads through the engine's own plugin entry point and adds the carveo
 | `SPARK_ATTIC_WEIGHTS` | For `weights`: parameter names or globs, comma-separated (default `embed_tokens`) |
 | `SPARK_ATTIC_MIB` | Use at most this many MiB of the carveout (default: all that is free) |
 | `SPARK_ATTIC_SOCK` | atticd's socket (default `/run/spark-attic/attic.sock`) |
-| `SPARK_ATTIC_KEY`, `SPARK_ATTIC_KEY_FILE` | The key (default `spark-attic-1`) |
+| `SPARK_ATTIC_KEY`, `SPARK_ATTIC_KEY_FILE` | The key (required; nothing is compiled in: atticd refuses to start without one, the client refuses to borrow without one) |
 
 From Python directly:
 
@@ -187,6 +245,10 @@ Point them at atticd's socket and key.
   clients) and every request needs the key.
 - The status file has no key and no physical address. Reading it never lets anyone borrow.
 - A slice goes to one client at a time and comes back only when RM has it back.
+- A lent slice arrives with whatever its previous holder left in it: atticd does not clear it (the RM shim
+  offers the daemon no write into a lent slice). Clear it before use: `Pool.borrow()` and the module
+  `borrow()` zero the mapping before returning it, and the plugins zero theirs; `Pool.map()` and `Pool.lend()`
+  do not.
 
 ## Provenance
 

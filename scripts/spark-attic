@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright 2026 bertholomus
+"""spark-attic: the node-side CLI of spark-attic, the GB10 display-carveout lender.
+
+    spark-attic status [--json]         what is lent, from the keyless status file
+    spark-attic doctor [--json]         the preflight plus the live checks, each with a fix;
+                                        exit code = problems found
+    spark-attic update --from DIR|TGZ   a new spark-attic or a new driver: install.sh's path,
+                                        validate before enable
+    spark-attic uninstall [--purge] [--yes]
+                                        remove everything install.sh put down; keeps the key
+                                        and the logs unless --purge
+    spark-attic version                 one line: spark-attic 0.1.0
+
+Every path honours --root DIR (a fake root for the host tests). Colour and the brand header
+appear only on a colour TTY: piped output, NO_COLOR, TERM=dumb, ATTIC_COLOR=never or --plain
+get plain text. The header art is the Bertholomus wordmark read from share/header-art.txt
+(and header-col.txt, the colour key per cell); with the art files absent the header is the
+plain text line, so the CLI works from a tree exported without them.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+APP_VERSION = "0.1.0"  # build-release.sh stamps this to the release version
+NAME = "spark-attic"
+
+# The icon kit's terminal colours: the frames and letters take the paper colour, the L nose the
+# gold-on-dark one, and the terminal keeps its own background.
+PAPER_RGB = (0xF3, 0xF2, 0xF2)
+GOLD_RGB = (0xE1, 0xAD, 0x66)
+PAPER_256 = 255   # #eeeeee, the nearest of the 256 to #f3f2f2
+GOLD_256 = 179    # #d7af5f, the nearest to #e1ad66
+
+
+# ---------------------------------------------------------------- colours and the header
+
+class Style:
+    """Whether the colours are on, and what they look like."""
+
+    def __init__(self, plain=False, colour=None, out=None):
+        self.out = out if out is not None else sys.stdout
+        ask = colour if colour is not None else os.environ.get("ATTIC_COLOR", "auto")
+        self.on = False
+        self.truecolor = False
+        if not plain and ask != "never" and not os.environ.get("NO_COLOR"):
+            term = os.environ.get("TERM", "")
+            if ask == "always" or (term and term != "dumb"
+                                   and hasattr(self.out, "isatty") and self.out.isatty()):
+                self.on = True
+                self.truecolor = bool(os.environ.get("COLORTERM")) or "direct" in term
+
+    def _code(self, rgb, idx256, bold=False):
+        if not self.on:
+            return ""
+        if self.truecolor:
+            return "\033[%s;38;2;%d;%d;%dm" % ("1;" if bold else "", rgb[0], rgb[1], rgb[2])
+        return "\033[%s38;5;%dm" % ("1;" if bold else "", idx256)
+
+    def reset(self):
+        return "\033[0m" if self.on else ""
+
+    @property
+    def paper(self):
+        return self._code(PAPER_RGB, PAPER_256)
+
+    @property
+    def paper_bold(self):
+        return self._code(PAPER_RGB, PAPER_256, bold=True)
+
+    @property
+    def gold(self):
+        return self._code(GOLD_RGB, GOLD_256)
+
+    @property
+    def gold_bold(self):
+        return self._code(GOLD_RGB, GOLD_256, bold=True)
+
+
+def share_dir(root=""):
+    """Where the installed share files live: the test override, then beside this script, then
+    the install path. --root moves the install path."""
+    env = os.environ.get("ATTIC_SHARE_DIR")
+    if env:
+        return env
+    beside = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "share", NAME)
+    if os.path.isdir(beside):
+        return beside
+    return os.path.join(root, "usr", "local", "share", NAME) if root else \
+        os.path.join("/usr/local/share", NAME)
+
+
+def load_art(root=""):
+    """The braille (both marks) and its colour keys, as lists of lines. (None, None) when
+    absent: the plain-text header takes over."""
+    d = share_dir(root)
+    try:
+        with open(os.path.join(d, "header-art.txt"), encoding="utf-8") as f:
+            art = [l.rstrip("\n") for l in f]
+        with open(os.path.join(d, "header-col.txt"), encoding="utf-8") as f:
+            cols = [l.rstrip("\n") for l in f]
+    except OSError:
+        return None, None
+    if not art or len(art) != len(cols):
+        return None, None
+    return art, cols
+
+
+KEY_COLOURS = {"p": "paper", "g": "gold"}
+
+
+def header_lines(style):
+    """The header: the Bertholomus wordmark when colour is on and the art is available, then the
+    name and version.
+    Returns lines without trailing newlines."""
+    title = "%s %s" % (NAME, APP_VERSION)
+    art, cols = (None, None)
+    if style.on:
+        art, cols = load_art()
+    if not art:
+        return [title]
+    lines = []
+    width = 0
+    for art_line, col_line in zip(art, cols):
+        parts = []  # (key, text) runs, so one escape covers a run of cells
+        run_key, run = None, ""
+        for i, ch in enumerate(art_line):
+            key = KEY_COLOURS.get(col_line[i] if i < len(col_line) else ".", "paper")
+            if key == run_key:
+                run += ch
+            else:
+                if run:
+                    parts.append((run_key, run))
+                run_key, run = key, ch
+        if run:
+            parts.append((run_key, run))
+        line = "".join(getattr(style, k) + text for k, text in parts)
+        lines.append(line + style.reset())
+        width = len(art_line)
+    pad = max(0, (width - len(title)) // 2)
+    lines.append(" " * pad + style.paper_bold + title + style.reset())
+    return lines
+
+
+def print_lines(lines, style):
+    for l in lines:
+        style.out.write(l + "\n")
+
+
+# ---------------------------------------------------------------- the step list
+
+class Steps:
+    """The progress list: a start line per step, then its gold check or its failure."""
+
+    def __init__(self, style):
+        self.style = style
+
+    def start(self, what):
+        if self.style.on:
+            self.style.out.write("  %s·%s %s\n" % (self.style.paper, self.style.reset(), what))
+        else:
+            self.style.out.write("  -> %s\n" % what)
+
+    def done(self, what, detail=""):
+        extra = " (%s)" % detail if detail else ""
+        if self.style.on:
+            self.style.out.write("    %s✓%s %s%s\n" % (self.style.gold, self.style.reset(), what, extra))
+        else:
+            self.style.out.write("    ok  %s%s\n" % (what, extra))
+
+    def fail(self, what, why, fix=""):
+        if self.style.on:
+            self.style.out.write("    %s✗%s %s — %s\n" % (self.style.paper_bold, self.style.reset(), what, why))
+        else:
+            self.style.out.write("    FAIL %s: %s\n" % (what, why))
+        if fix:
+            self.style.out.write("        %s\n" % fix)
+
+    def closing(self, mib):
+        """The closing line: the big number."""
+        num = "{:,}".format(int(mib))
+        if self.style.on:
+            self.style.out.write("\n  %s+%s MiB%s lent to CUDA\n\n"
+                                 % (self.style.gold_bold, num, self.style.reset()))
+        else:
+            self.style.out.write("\n  +%s MiB lent to CUDA\n\n" % num)
+
+
+# ---------------------------------------------------------------- paths and helpers
+
+def p(root, *parts):
+    # with no --root the paths are the real ones under /, whatever the working directory is
+    # (node window 3: a bare join made status, doctor and uninstall read ./run, ./etc, ... instead of /run, /etc)
+    return os.path.join(root or "/", *parts)
+
+
+def mib_str(n):
+    return "{:,}".format(int(n))
+
+
+def run(cmd):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def find_install_sh(root=""):
+    """install.sh, for update and for doctor's preflight: the test override, then beside the
+    share files, then a checkout's root."""
+    env = os.environ.get("ATTIC_INSTALL")
+    if env:
+        return env
+    cands = [os.path.join(share_dir(root), "install.sh"),
+             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "install.sh"),
+             "install.sh"]
+    for c in cands:
+        if os.path.isfile(c):
+            return os.path.abspath(c)
+    return None
+
+
+# ---------------------------------------------------------------- status
+
+def read_status(root=""):
+    """The status file per STATUS-FILE.md's reading rules: (record, state) with state one of
+    ok, missing, stale, unreadable."""
+    path = p(root, "run", "spark-attic", "status.json")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(8192)
+    except OSError:
+        return None, "missing"
+    try:
+        rec = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return None, "unreadable"
+    if not isinstance(rec, dict) or rec.get("name") != NAME:
+        return None, "unreadable"
+    every = rec.get("every_s", 10)
+    updated = rec.get("updated", 0)
+    now = time.time()
+    if updated + 3 * every < now or updated > now + 3 * every:
+        return rec, "stale"
+    return rec, "ok"
+
+
+def unit_state(root=""):
+    """(active, enabled) from systemctl, or (None, None) when systemctl cannot be asked."""
+    try:
+        a = run(["systemctl", "is-active", "--quiet", "attic.service"]).returncode
+        e = run(["systemctl", "is-enabled", "attic.service"]).returncode
+        return a == 0, e == 0
+    except OSError:
+        return None, None
+
+
+def cmd_status(style, root="", as_json=False):
+    rec, state = read_status(root)
+    if as_json:
+        if state == "ok":
+            style.out.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            return 0
+        style.out.write(json.dumps({"error": state}, separators=(",", ":")) + "\n")
+        return 1
+    print_lines(header_lines(style), style)
+    if state == "missing":
+        active, _ = unit_state(root)
+        why = "atticd is not installed, stopped, or runs with --no-status-file"
+        if active is False:
+            why = "attic.service is not running"
+        elif active is None:
+            why += " (systemd could not be asked)"
+        style.out.write("  no status file at %s: %s\n" % (p(root, "run", "spark-attic", "status.json"), why))
+        style.out.write("  check: systemctl show -p ActiveState attic.service\n")
+        style.out.write("  start: systemctl start attic.service\n")
+        return 1
+    if state == "stale":
+        style.out.write("  the status file is stale (not rewritten for over %d s): atticd is not running,\n"
+                        % (3 * rec.get("every_s", 10)))
+        style.out.write("  so nothing in it is current — no numbers are shown\n")
+        style.out.write("  check: systemctl show -p ActiveState attic.service\n")
+        return 1
+    if state == "unreadable":
+        style.out.write("  the status file is unreadable or is not %s's: unknown\n" % NAME)
+        return 1
+    why = rec.get("why", "")
+    style.out.write("  state     %s%s\n" % (rec.get("state", "?"), (" — " + why) if why else ""))
+    if rec.get("state") == "ready":
+        style.out.write("  lent      %s MiB (of %s MiB; largest free run %s MiB)\n"
+                        % (mib_str(rec.get("lent_mib", 0)), mib_str(rec.get("size_mib", 0)),
+                           mib_str(rec.get("largest_mib", 0))))
+        style.out.write("  free      %s MiB (draining %s MiB)\n"
+                        % (mib_str(rec.get("free_mib", 0)), mib_str(rec.get("draining_mib", 0))))
+    style.out.write("  clients   %d\n" % rec.get("clients", 0))
+    style.out.write("  driver    %s, %s\n" % (rec.get("driver", "?"),
+                                              "validated" if rec.get("validated") else "not validated"))
+    return 0 if rec.get("state") == "ready" and rec.get("validated") else 1
+
+
+# ---------------------------------------------------------------- doctor
+
+def installed_artifact_view(root=""):
+    """A view of the installed artifact for install.sh --check: bin/atticd and artifacts/<driver>
+    from what is installed. doctor called --check with no artifact, so a healthy node printed "no
+    artifact yet" for the shim and the display; the installed files answer those checks instead.
+    Returns a temp dir, or None when nothing is installed."""
+    atticd = p(root, "usr", "local", "sbin", "atticd")
+    arts = p(root, "var", "lib", "attic", "artifacts")
+    if not os.path.isfile(atticd) or not os.path.isdir(arts):
+        return None
+    tmp = tempfile.mkdtemp(prefix="spark-attic-doctor-")
+    try:
+        os.makedirs(os.path.join(tmp, "bin"))
+        os.symlink(atticd, os.path.join(tmp, "bin", "atticd"))
+        os.makedirs(os.path.join(tmp, "artifacts"))
+        for d in os.listdir(arts):
+            src = os.path.join(arts, d)
+            if os.path.isdir(src):
+                os.symlink(src, os.path.join(tmp, "artifacts", d))
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+    return tmp
+
+
+def preflight_via_install_sh(root=""):
+    """install.sh --check --format json: its preflight is the product's one preflight.
+    Returns the check records, or None when install.sh is not there or says nothing parseable."""
+    inst = find_install_sh(root)
+    if inst is None:
+        return None
+    view = installed_artifact_view(root)
+    try:
+        cmd = ["bash", inst, "--check", "--format", "json"]
+        if root:
+            cmd += ["--root", root]
+        if view:
+            cmd += ["--from", view]
+        r = run(cmd)
+    except OSError:
+        return None
+    finally:
+        if view:
+            shutil.rmtree(view, ignore_errors=True)
+    records = []
+    for line in r.stdout.decode("utf-8", "replace").splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and "id" in rec and "state" in rec:
+            records.append(rec)
+    return records or None
+
+
+def cmd_doctor(style, root="", as_json=False):
+    print_lines(header_lines(style), style)
+    problems = 0
+    rows = []
+
+    def row(iid, ok, what, fix="", warn=False):
+        nonlocal problems
+        state = "pass" if ok else ("warn" if warn else "fail")
+        if not ok and not warn:
+            problems += 1
+        rows.append({"id": iid, "state": state, "what": what, "fix": fix})
+        if as_json:
+            return
+        if ok:
+            style.out.write("  %s✓%s %s\n" % (style.gold, style.reset(), what))
+        elif warn:
+            style.out.write("  ~ %s (fix when you can: %s)\n" % (what, fix))
+        else:
+            style.out.write("  %s✗%s %s\n        %s\n" % (style.paper_bold, style.reset(), what, fix))
+
+    recs, inst = preflight_via_install_sh(root), find_install_sh(root)
+    if recs is None:
+        row("preflight", False, "install.sh is not where this CLI expects it (%s)"
+            % (inst or os.path.join("/usr/local/share", NAME, "install.sh")),
+            "re-run install.sh: it installs itself beside the share files")
+    else:
+        for r in recs:
+            row(r["id"], r["state"] == "pass", r.get("what", r["id"]), r.get("fix", ""),
+                warn=(r["state"] == "warn"))
+
+    unit = p(root, "etc", "systemd", "system", "attic.service")
+    row("unit", os.path.isfile(unit), "the unit is installed", "re-run install.sh: the unit is part of it")
+    active, enabled = unit_state(root)
+    if active is None:
+        row("systemctl", False, "systemctl could not be asked about attic.service",
+            "check that systemd is running")
+    else:
+        row("enabled", enabled, "attic.service is enabled", "systemctl enable attic.service")
+        row("active", active, "attic.service is active",
+            "systemctl start attic.service; if it fails: journalctl -u attic.service -n 50")
+    rec, state = read_status(root)
+    if state == "ok":
+        row("status", True, "the status file is current (every %d s)" % rec.get("every_s", 10))
+        row("version", rec.get("version") == APP_VERSION,
+            "atticd's version matches this CLI (%s)" % APP_VERSION,
+            "spark-attic update --from <the newer artifact>")
+        row("socket", os.path.exists(p(root, "run", "spark-attic", "attic.sock")),
+            "the socket is there", "systemctl start attic.service")
+    elif state == "missing":
+        row("status", active is True, "no status file",
+            "start attic.service; if the unit is not installed, re-run install.sh")
+    elif state == "stale":
+        row("status", False, "the status file is stale (atticd is not running)",
+            "systemctl start attic.service")
+    else:
+        row("status", False, "the status file is unreadable", "journalctl -u attic.service -n 50")
+
+    key = p(root, "etc", "spark-attic", "key")
+    if os.path.isfile(key):
+        mode = oct(os.stat(key).st_mode & 0o777)
+        row("key", mode == "0o600", "the key file is root-only (%s)" % mode, "chmod 600 %s" % key)
+    else:
+        row("key", False, "no key file at %s" % key,
+            "re-run install.sh: it creates one when none exists (it never overwrites a key)")
+
+    driver = rec.get("driver") if rec else None
+    if driver and driver != "none":
+        vfile = p(root, "var", "lib", "attic", "artifacts", driver, "VALIDATED")
+        modes = ""
+        if os.path.isfile(vfile):
+            with open(vfile, encoding="utf-8") as f:
+                m = re.search(r"^modes=(.*)$", f.read(), re.M)
+            modes = (m.group(1) if m else "").strip()
+        row("validated", bool(modes),
+            "driver %s is validated" % driver if modes
+            else "driver %s has no VALIDATED record" % driver,
+            "spark-attic update --from <an artifact for driver %s>, or scripts/attic-update.sh "
+            "on a build host" % driver)
+    if as_json:
+        style.out.write(json.dumps({"problems": problems, "checks": rows}, indent=1) + "\n")
+    else:
+        style.out.write("\n  doctor: %d problem%s%s\n" % (problems, "" if problems == 1 else "s",
+                                                          "" if problems else " — everything checks out"))
+    return problems
+
+
+# ---------------------------------------------------------------- update / uninstall / version
+
+def cmd_demo(root="", fail=None, extra=()):
+    """The demo: install.sh --demo, the real flow against a simulated GB10."""
+    inst = find_install_sh(root)
+    if inst is None:
+        sys.stderr.write("spark-attic demo needs install.sh beside the share files (%s): "
+                         "point ATTIC_INSTALL at it\n" % share_dir(root))
+        return 1
+    cmd = ["bash", inst, "--demo"]
+    if fail:
+        cmd += ["--fail", fail]
+    cmd += list(extra)
+    os.execvp("bash", cmd)
+
+
+def cmd_update(root="", from_=None):
+    inst = find_install_sh(root)
+    if inst is None:
+        sys.stderr.write("spark-attic update needs install.sh beside the share files (%s): "
+                         "re-run the installer, or point ATTIC_INSTALL at it\n" % share_dir(root))
+        return 1
+    if not from_:
+        sys.stderr.write("give --from DIR (an unpacked artifact) or --from TARBALL: the node does not "
+                         "fetch for itself\n")
+        return 2
+    cmd = ["bash", inst, "--from", from_]
+    if root:
+        cmd += ["--root", root]
+    os.execvp("bash", cmd)  # install.sh prints its own header and steps
+
+
+LOG_ON = [True]  # flipped off by --purge: the log is gone and must stay gone
+
+
+def cmd_uninstall(style, root="", purge=False, yes=False):
+    print_lines(header_lines(style), style)
+    if not yes:
+        if not sys.stdin.isatty():
+            style.out.write("  refusing to uninstall without --yes when not on a terminal\n")
+            return 1
+        style.out.write("  remove spark-attic (atticd, the unit, the artifacts)? the key and the logs "
+                        "stay unless --purge. type yes: ")
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+            style.out.write("  uninstall cancelled: nothing changed\n")
+            return 1
+    logdir = p(root, "var", "log", NAME)
+    logfile = os.path.join(logdir, "install.log")
+
+    def log(msg):
+        if not LOG_ON[0]:
+            return
+        try:
+            os.makedirs(logdir, exist_ok=True)
+            with open(logfile, "a", encoding="utf-8") as f:
+                f.write("%s uninstall: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg))
+        except OSError:
+            pass
+
+    targets = [
+        p(root, "etc", "systemd", "system", "attic.service"),
+        p(root, "usr", "local", "sbin", "atticd"),
+        p(root, "usr", "local", "sbin", "attic-check"),
+        p(root, "usr", "local", "bin", NAME),
+        p(root, "usr", "local", "share", NAME),
+        p(root, "var", "lib", "attic"),
+        p(root, "run", "spark-attic"),
+        p(root, "etc", "sysctl.d", "99-spark-attic-minfree.conf"),
+    ]
+    present = [t for t in targets if os.path.exists(t)]
+    if not present:
+        style.out.write("  nothing to remove: spark-attic is not installed\n")
+        return 0
+    steps = Steps(style)
+    # disable --now, not just stop: a stop leaves the multi-user.target.wants link, so the unit stays
+    # enabled after its file is gone (systemd reports it failed at the next boot). disable --now stops
+    # it and removes the link; INSTALL.md's manual path is this same command.
+    steps.start("disabling and stopping attic.service")
+    if run(["systemctl", "disable", "--now", "attic.service"]).returncode == 0:
+        steps.done("disabled and stopped attic.service")
+        log("disabled and stopped attic.service")
+    else:
+        steps.fail("disable", "systemctl disable --now failed", "systemctl status attic.service")
+        return 1
+    steps.start("removing")
+    for t in present:
+        if os.path.isdir(t) and not os.path.islink(t):
+            run(["chmod", "-R", "u+rwx", t])  # root-only report files must not block removal
+        if run(["rm", "-rf", "--", t]).returncode != 0:
+            steps.fail("remove", "could not remove %s" % t)
+            return 1
+        log("removed %s" % t)
+    steps.done("removed", "%d target%s" % (len(present), "" if len(present) == 1 else "s"))
+    steps.start("reloading systemd")
+    run(["systemctl", "daemon-reload"])
+    steps.done("reloaded systemd")
+    log("daemon-reload")
+    if purge:
+        for t in (p(root, "etc", "spark-attic"), logdir):
+            if os.path.exists(t):
+                run(["rm", "-rf", "--", t])
+        # nothing is logged past the purge: the log itself is gone (and must stay gone)
+        LOG_ON[0] = False
+        steps.done("purged", "the key and the logs are gone")
+    else:
+        steps.done("kept", "the key (%s) and the logs (%s)" % (p(root, "etc", "spark-attic"), logfile))
+    style.out.write("\n  spark-attic removed. memory a running engine still holds comes back when "
+                    "it exits.\n\n")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog=NAME, description="spark-attic node CLI",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    for name in ("status", "doctor", "update", "uninstall", "demo", "version"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--json", action="store_true", help="machine output (status, doctor)")
+        sp.add_argument("--plain", action="store_true",
+                        help="no colour and no header art, even on a colour terminal")
+        sp.add_argument("--root", default="", help="operate under this root instead of / (tests)")
+        if name == "update":
+            sp.add_argument("--from", dest="from_", metavar="DIR|TARBALL",
+                            help="the artifact to install from")
+        if name == "uninstall":
+            sp.add_argument("--purge", action="store_true", help="also remove the key and the logs")
+            sp.add_argument("--yes", action="store_true", help="do not ask (non-interactive)")
+        if name == "demo":
+            sp.add_argument("--fail", metavar="STEP",
+                            help="show a refusal path: display, driver, lender or validate")
+    a = ap.parse_args(argv)
+    if a.cmd in (None, "version"):
+        style = Style()
+        style.out.write("%s %s\n" % (NAME, APP_VERSION))
+        return 0
+    style = Style(plain=a.plain)
+    if a.cmd == "status":
+        return cmd_status(style, root=a.root, as_json=a.json)
+    if a.cmd == "doctor":
+        return cmd_doctor(style, root=a.root, as_json=a.json)
+    if a.cmd == "update":
+        return cmd_update(root=a.root, from_=a.from_)
+    if a.cmd == "uninstall":
+        return cmd_uninstall(style, root=a.root, purge=a.purge, yes=a.yes)
+    if a.cmd == "demo":
+        return cmd_demo(root=a.root, fail=a.fail)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

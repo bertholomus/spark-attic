@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <unistd.h>
 
 #include "shim.h"
@@ -31,6 +33,8 @@
 
 struct block {
     int used, ram, released; /* released: atticd let go, a process still refers to its memfd */
+    int mfd;                 /* the block's own memfd, open for the block's lifetime: re-exporting the slice
+                              * hands out the same memory, with the previous holder's bytes still in it (S3) */
     uint64_t first, n, size;
     char name[48]; /* the memfd exported for it */
 };
@@ -39,7 +43,14 @@ struct attic_rm {
     uint64_t base, size;
     uint8_t *taken; /* one per slice */
     struct block h[MAX_HANDLES];
+    struct {              /* retired blocks' memfds, parked while nobody holds the range (S3: the bytes stay) */
+        uint64_t first, n;
+        int fd;
+    } park[8];
 };
+
+static void park(struct attic_rm *rm, struct block *b);
+static int unpark(struct attic_rm *rm, uint64_t first, uint64_t n);
 
 static void say(char *err, size_t n, const char *fmt, ...)
 {
@@ -52,7 +63,25 @@ static void say(char *err, size_t n, const char *fmt, ...)
 static int fails(const char *call)
 {
     const char *f = getenv("ATTIC_FAKE_FAIL");
-    return f && strstr(f, call) != NULL;
+    if (f && strstr(f, call) != NULL)
+        return 1;
+    /* ATTIC_FAKE_FAIL_FILE: a file whose contents name the failing calls, re-read per call, so a test can flip a
+     * running daemon's shim from healthy to failing and back. */
+    const char *p = getenv("ATTIC_FAKE_FAIL_FILE");
+    if (p) {
+        char buf[128] = "";
+        int fd = open(p, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t r = read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (r > 0) {
+                buf[r] = 0;
+                if (strstr(buf, call) != NULL)
+                    return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 static int fake_open(struct attic_rm **out, int minor, char *err, size_t n)
@@ -79,6 +108,8 @@ static int fake_open(struct attic_rm **out, int minor, char *err, size_t n)
         free(rm);
         return -ENOMEM;
     }
+    for (int i = 0; i < 8; i++)
+        rm->park[i].fd = -1;
     for (uint64_t i = 0; i < held / SLICE && i < rm->size / SLICE; i++)
         rm->taken[i] = 1;
     *out = rm;
@@ -125,6 +156,8 @@ static int referenced(const char *name)
     while (!found && (e = readdir(p)) != NULL) {
         if (e->d_name[0] < '0' || e->d_name[0] > '9')
             continue;
+        if ((pid_t)atoi(e->d_name) == getpid())
+            continue; /* our own master memfds say nothing about a client (S3) */
         char path[300], line[600];
         snprintf(path, sizeof path, "/proc/%s/maps", e->d_name);
         FILE *f = fopen(path, "r");
@@ -160,6 +193,8 @@ static void collect(struct attic_rm *rm)
         struct block *b = &rm->h[i];
         if (b->used && b->released && !referenced(b->name)) {
             memset(rm->taken + b->first, 0, b->n);
+            if (b->mfd >= 0)
+                park(rm, b);
             memset(b, 0, sizeof *b);
         }
     }
@@ -197,13 +232,14 @@ static int fake_heap(struct attic_rm *rm, uint64_t size, uint32_t *handle, char 
             j++;
         if (j == want) {
             memset(rm->taken + i, 1, want);
-            rm->h[k] = (struct block){1, 0, 0, i, want, size, ""};
+            rm->h[k] = (struct block){1, 0, 0, unpark(rm, i, want), i, want, size, ""};
+            snprintf(rm->h[k].name, sizeof rm->h[k].name, "attic-fake-%d-%08x", (int)getpid(), *handle);
             return 0;
         }
         i += j;
     }
     if (getenv("ATTIC_FAKE_RAM")) {
-        rm->h[k] = (struct block){1, 1, 0, 0, 0, size, ""};
+        rm->h[k] = (struct block){1, 1, 0, -1, 0, 0, size, ""};
         return 0;
     }
     say(err, n, "fake: NV_ERR_NO_MEMORY");
@@ -223,7 +259,7 @@ static int fake_list(struct attic_rm *rm, uint64_t base, uint64_t size, uint32_t
     int k = new_handle(rm, handle, err, n);
     if (k < 0)
         return -ENOSPC;
-    rm->h[k] = (struct block){1, 0, 0, 0, 0, size, ""}; /* a list takes no heap room */
+    rm->h[k] = (struct block){1, 0, 0, -1, 0, 0, size, ""}; /* a list takes no heap room */
     return 0;
 }
 
@@ -233,23 +269,73 @@ static struct block *find(struct attic_rm *rm, uint32_t handle)
     return i < MAX_HANDLES && rm->h[i].used ? &rm->h[i] : NULL;
 }
 
+/* Park a released block's memfd (its bytes survive, as real display memory's do), or take one back for the
+ * same slice range. The park holds 8 ranges; a ninth evicts the oldest. */
+static void park(struct attic_rm *rm, struct block *b)
+{
+    int slot = -1;
+    for (int i = 0; i < 8 && slot < 0; i++)
+        if (rm->park[i].fd < 0)
+            slot = i;
+    if (slot < 0) {
+        close(rm->park[0].fd);
+        slot = 0;
+    }
+    rm->park[slot] = (typeof(rm->park[0])){b->first, b->n, b->mfd};
+    b->mfd = -1;
+}
+
+static int unpark(struct attic_rm *rm, uint64_t first, uint64_t n)
+{
+    for (int i = 0; i < 8; i++)
+        if (rm->park[i].fd >= 0 && rm->park[i].first == first && rm->park[i].n == n) {
+            int fd = rm->park[i].fd;
+            rm->park[i].fd = -1;
+            return fd;
+        }
+    return -1;
+}
+
 static int fake_export(struct attic_rm *rm, uint32_t handle, int *fd, char *err, size_t n)
 {
-    static unsigned serial;
     struct block *b = find(rm, handle);
     if (b == NULL || b->released || fails("export")) {
         say(err, n, "fake: export refused");
         return -EINVAL;
     }
-    snprintf(b->name, sizeof b->name, "attic-fake-%d-%08u", (int)getpid(), ++serial);
-    int f = memfd_create(b->name, MFD_CLOEXEC);
-    if (f < 0 || ftruncate(f, (off_t)b->size) != 0) {
-        if (f >= 0)
-            close(f);
-        say(err, n, "fake: memfd: %s", strerror(errno));
+    if (b->mfd < 0) {
+        b->mfd = unpark(rm, b->first, b->n); /* the same slices: the previous holder's bytes come with them */
+        if (b->mfd >= 0)
+            snprintf(b->name, sizeof b->name, "attic-fake-%d-%08x", (int)getpid(), handle);
+    }
+    if (b->mfd < 0) {
+        /* A block never lent before: one memfd for its lifetime, dirtied so a borrower that does not clear
+         * reads something other than a fresh allocation's zeros. The descriptor each export hands out is a
+         * dup; closing it never frees the block's memory behind the shim's back. */
+        snprintf(b->name, sizeof b->name, "attic-fake-%d-%08x", (int)getpid(), handle);
+        int f = memfd_create(b->name, MFD_CLOEXEC);
+        if (f < 0 || ftruncate(f, (off_t)b->size) != 0) {
+            if (f >= 0)
+                close(f);
+            say(err, n, "fake: memfd: %s", strerror(errno));
+            return -errno;
+        }
+        static const char dirty[] = "attic-fake: a slice arrives with its previous holder's bytes in it.\n";
+        size_t left = b->size;
+        while (left > 0) {
+            size_t w = left < sizeof dirty - 1 ? left : sizeof dirty - 1;
+            if (write(f, dirty, w) < 0)
+                break;
+            left -= w;
+        }
+        b->mfd = f;
+    }
+    int d = fcntl(b->mfd, F_DUPFD_CLOEXEC, 0);
+    if (d < 0) {
+        say(err, n, "fake: dup: %s", strerror(errno));
         return -errno;
     }
-    *fd = f;
+    *fd = d;
     return 0;
 }
 
@@ -266,6 +352,8 @@ static int fake_release(struct attic_rm *rm, uint32_t handle, char *err, size_t 
     }
     if (b->n)
         memset(rm->taken + b->first, 0, b->n);
+    if (b->mfd >= 0)
+        park(rm, b);
     memset(b, 0, sizeof *b);
     return 0;
 }

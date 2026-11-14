@@ -3,7 +3,7 @@
 # spark-attic: lends the GB10 display carveout to CUDA programs (atticd). See README.md and INSTALL.md.
 [Unit]
 Description=spark-attic display-carveout lender (atticd)
-After=nvidia-persistenced.service
+After=nvidia-persistenced.service display-manager.service
 Wants=nvidia-persistenced.service
 
 [Service]
@@ -15,6 +15,23 @@ RestartSec=5
 RuntimeDirectory=spark-attic
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
+
+# Hardening: atticd runs as root (the RM client needs root; mode list too) but within this box. What is left off,
+# and why, is in INSTALL.md section 5.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=-/run/spark-attic
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

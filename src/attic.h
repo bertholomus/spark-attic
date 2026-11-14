@@ -9,7 +9,6 @@
 
 #define ATTIC_SLICE ((uint64_t)2 << 20) /* lent memory comes in whole 2 MiB slices (our client's granule) */
 #define ATTIC_DEFAULT_SOCKET "/run/spark-attic/attic.sock"
-#define ATTIC_DEFAULT_KEY "spark-attic-1"
 #define ATTIC_DEFAULT_ARTIFACTS "/var/lib/attic/artifacts"
 #define ATTIC_DEFAULT_VERSION_FILE "/proc/driver/nvidia/version"
 #define ATTIC_REPLY_MAX 4096 /* our client reads a reply of at most this */

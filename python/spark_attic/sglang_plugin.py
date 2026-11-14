@@ -10,28 +10,55 @@ or as the home of named weights, in SGLang's model runner. It registers AROUND h
     SPARK_ATTIC_LOG      0: no log handler of our own (default: our lines on stderr, logger spark_attic)
     and the client's SPARK_ATTIC_SOCK, SPARK_ATTIC_KEY or SPARK_ATTIC_KEY_FILE, SPARK_ATTIC_TIMEOUT_MS.
 
-kv: when the KV pool will be the plain MHA pool (MHATokenToKVPool, NHD layout: dense attention, no MLA, SWA, Mamba,
-FP4, memory saver, custom pool or speculative decoding), _profile_available_bytes borrows the carveout and adds it to
-what SGLang measured, so its pool sizing gives the KV cache exactly that much more. MHATokenToKVPool._create_buffers
-then gets its last K/V buffers (the V buffers of the last layers) from the carveout, the one before them glued from
-device memory: a TorchFunctionMode answers exactly those torch.zeros calls, after checking each one's shape, dtype and
-device against the plan, so SGLang's own code builds the pool around them. With more than one rank, the ranks first
-agree on one amount over SGLang's world group (the smallest any of them can borrow, or none), as SGLang agrees on free
-memory, so every rank's pool keeps the same size. --max-total-tokens caps the pool's device memory, not the pool: when
-the cap binds, _apply_token_constraints lets the pool take the carveout's tokens (SGLang's own configurator turns its
-bytes into tokens) on top of the cap, as the vLLM plugin adds the carveout on top of --kv-cache-memory-bytes. weights:
-after ModelRunner.load_model the named parameters move into the carveout; SGLang measures free memory after the load,
-so the KV pool gets that much more by itself (up to --max-total-tokens).
+There is no pinned SGLang version. The plugin knows two shapes of SGLang's KV sizing and, in each process, picks the
+one the running engine really has, by what its modules expose (the tables below; tests/test_sglang_plugin.py proves
+each shape against SGLang's own source for every supported release, and scripts/attic-engine-drift.sh runs that test
+against the newest release tags):
 
-Pinned to SGLang 0.5.14 (upstream tag v0.5.14, 49e384ce; NGC nvidia/sglang:26.07-py3 ships 0.5.14+0e76cb3c). Each
-hook's target, and each function in CALLS, must have the parameters listed there or that placement's hooks are not
-registered. Anything else (another pool kind, no atticd, nothing free) leaves that placement off and SGLang runs as
-without the plugin (fail open, one log line, logger "spark_attic").
+  0.5.14: the model runner's KV methods live in model_runner_kv_cache_mixin.ModelRunnerKVCacheMixin, the
+          configurator is built from the model runner (create_memory_pool_configurator(mr)), and the plain MHA pool's
+          _create_buffers makes one torch.zeros per layer, K then V.
+  0.5.23: the same methods moved into mem_cache.kv_cache_configurator.KVCacheConfigurator (which carries what the
+          model runner used to: device, server_args, the pool fields), the configurator is built from it
+          (create_memory_pool_configurator(kvc)), the cap is read through get_schedule(), and _create_buffers makes
+          one fused torch.zeros per layer, K and V in one allocation, so the pool keeps views of it.
+
+The hook-signature shape says nothing about how the pool allocates its buffers: 0.5.21 has 0.5.23's signatures
+but its plain MHA pool still allocates K and V as their own zeros calls, one per layer, K's for all layers first
+(0.5.14's layout). So before the KV budget is raised the plugin reads the buffer layout from the pool class's own
+_create_buffers source (_layout_rule: fused when a zeros call starts with the literal 2 of the fused (2, padded,
+H, D) allocation, separate otherwise, None when neither can be read) and plans the placement against that; a
+pattern the plugin cannot read keeps the KV placement off with one log line, before anything is raised.
+
+kv: when the KV pool will be the plain MHA pool (MHATokenToKVPool, NHD layout: dense attention, no MLA, SWA, Mamba,
+FP4 or other quantized store, memory saver, custom pool, HND or page-major layout, MiniMax-sparse model, post-capture
+KV, unequal K and V head sizes, or speculative decoding), _profile_available_bytes borrows
+the carveout and adds it to what SGLang measured, so its pool sizing gives the KV cache exactly that much more.
+MHATokenToKVPool._create_buffers then gets its last buffers from the carveout, the one before them glued from device
+memory: a TorchFunctionMode answers exactly those torch.zeros calls, after checking each one's shape, dtype and
+device against the plan, so SGLang's own code builds the pool around them. With more than one rank, the ranks first
+agree on one amount over SGLang's world group (the smallest any of them can borrow, or none), as SGLang agrees on
+free memory, so every rank's pool keeps the same size. --max-total-tokens caps the pool's device memory, not the
+pool: when the cap binds, _apply_token_constraints lets the pool take the carveout's tokens on top of the cap, as
+the vLLM plugin adds the carveout on top of --kv-cache-memory-bytes. weights: after ModelRunner.load_model the named
+parameters move into the carveout; SGLang measures free memory after the load, so the KV pool gets that much more by
+itself (up to --max-total-tokens).
+
+Fail open until the KV budget is raised, loud after it: anything seen before the profile hook (a shape the plugin
+does not know, a mismatched signature, another pool kind, no atticd, nothing free) turns that placement off and
+SGLang runs as without the plugin (one log line, logger "spark_attic"). Once the plugin has added the carveout to
+the KV budget, a failed placement can no longer fail open: falling back would leave SGLang allocating the KV pool
+above the memory it measured, so the plugin gives the carveout back and raises instead, and SGLang stops coming up
+until the plugin is turned off (SPARK_ATTIC_PLACE=off).
 """
+import ast
+import inspect
 import logging
 import os
 import pkgutil
+import textwrap
 import threading
+from contextlib import contextmanager
 
 from . import MIB, Pool, Settings
 from ._place import (Ledger, Mismatch, Placement, device_index, give_back, log_to_stderr, model_of, move_params,
@@ -39,25 +66,46 @@ from ._place import (Ledger, Mismatch, Placement, device_index, give_back, log_t
 
 log = logging.getLogger("spark_attic")
 GIB = 1 << 30
-SGLANG_PINNED = "0.5.14"
 
-MIXIN = "sglang.srt.model_executor.model_runner_kv_cache_mixin.ModelRunnerKVCacheMixin"
 MHA = "sglang.srt.mem_cache.memory_pool.MHATokenToKVPool"
 RUNNER = "sglang.srt.model_executor.model_runner.ModelRunner"
+MIXIN = "sglang.srt.model_executor.model_runner_kv_cache_mixin.ModelRunnerKVCacheMixin"
+CONF = "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator"
 CONFIGURATOR = "sglang.srt.model_executor.pool_configurator"
-# What each hook wraps, and that function's parameters in SGLang v0.5.14.
+
+# The engine shapes the plugin knows, oldest first.
+SHAPES = ("0.5.14", "0.5.23")
+SHAPE_RELEASE = {"0.5.14": "0.5.14", "0.5.23": "0.5.23"}
+
+# What each hook wraps, and that function's parameters, per shape.
 TARGETS = {
-    "profile": (MIXIN + "._profile_available_bytes", ["self", "pre_model_load_memory"]),
-    "cap": (MIXIN + "._apply_token_constraints", ["self", "token_capacity"]),
-    "pools": (MIXIN + "._init_pools", ["self"]),
-    "buffers": (MHA + "._create_buffers", ["self"]),
-    "load": (RUNNER + ".load_model", ["self"]),
+    "0.5.14": {
+        "profile": (MIXIN + "._profile_available_bytes", ["self", "pre_model_load_memory"]),
+        "cap": (MIXIN + "._apply_token_constraints", ["self", "token_capacity"]),
+        "pools": (MIXIN + "._init_pools", ["self"]),
+        "buffers": (MHA + "._create_buffers", ["self"]),
+        "load": (RUNNER + ".load_model", ["self"]),
+    },
+    "0.5.23": {
+        "profile": (CONF + "._profile_available_bytes", ["self", "pre_model_load_memory"]),
+        "cap": (CONF + "._apply_token_constraints", ["self", "token_capacity"]),
+        "pools": (CONF + "._init_pools", ["self", "sizes", "req_to_token_pool", "token_to_kv_pool_allocator"]),
+        "buffers": (MHA + "._create_buffers", ["self"]),
+        "load": (RUNNER + ".load_model", ["self"]),
+    },
 }
 # What the cap hook calls, likewise.
 CALLS = {
-    "configurator": (CONFIGURATOR + ".create_memory_pool_configurator", ["mr"]),
-    "pool_sizes": (CONFIGURATOR + ".DefaultPoolConfigurator.calculate_pool_sizes",
-                   ["self", "available_bytes", "page_size"]),
+    "0.5.14": {
+        "configurator": (CONFIGURATOR + ".create_memory_pool_configurator", ["mr"]),
+        "pool_sizes": (CONFIGURATOR + ".DefaultPoolConfigurator.calculate_pool_sizes",
+                       ["self", "available_bytes", "page_size"]),
+    },
+    "0.5.23": {
+        "configurator": (CONFIGURATOR + ".create_memory_pool_configurator", ["kvc"]),
+        "pool_sizes": (CONFIGURATOR + ".DefaultPoolConfigurator.calculate_pool_sizes",
+                       ["self", "available_bytes", "page_size"]),
+    },
 }
 
 
@@ -71,6 +119,8 @@ class _State:
         self.kv = None            # the Lent for the KV pool, between the profile and the buffers
         self.kv_counted = 0
         self.kv_done = False      # the pool was built: a later sizing gets no carveout
+        self.shape = None         # which engine shape the KV hooks run as
+        self.layout = None        # how the pool's _create_buffers allocates: separate | fused
         self.hooked = set()       # TARGETS keys registered
         self.keep = []
         self.lock = threading.RLock()
@@ -99,28 +149,44 @@ def register():
 
         hooks = {"profile": _profile_hook, "cap": _cap_hook, "pools": _pools_hook, "buffers": _buffers_hook,
                  "load": _load_hook}
-        groups = []
         if "kv" in S.placement.place:
-            groups.append(("KV", ("profile", "cap", "pools", "buffers"), ("configurator", "pool_sizes")))
+            shape, why = _kv_shape(("profile", "cap", "pools", "buffers"), ("configurator", "pool_sizes"))
+            if shape is None:
+                log.warning("spark-attic: KV placement off: %s", why)
+            else:
+                S.shape = shape
+                for key in ("profile", "cap", "pools", "buffers"):
+                    HookRegistry.register(TARGETS[shape][key][0], hooks[key], HookType.AROUND)
+                    S.hooked.add(key)
         if "weights" in S.placement.place:
-            groups.append(("weights", ("load",), ()))
-        for what, keys, calls in groups:  # a placement's hooks go in all together or not at all
             try:
-                for key in keys + calls:
-                    _check(key)
+                _check("load", shape=S.shape or "0.5.14")
             except Mismatch as e:
-                log.warning("spark-attic: %s placement off: %s", what, e)
-                continue
-            for key in keys:
-                HookRegistry.register(TARGETS[key][0], hooks[key], HookType.AROUND)
-                S.hooked.add(key)
+                log.warning("spark-attic: weights placement off: %s", e)
+            else:
+                HookRegistry.register(TARGETS[S.shape or "0.5.14"]["load"][0], _load_hook, HookType.AROUND)
+                S.hooked.add("load")
     except Exception as e:
         S.placement = Placement(place=())
         log.warning("spark-attic: SGLang plugin off: %s: %s", type(e).__name__, e)
 
 
-def _check(key):
-    target, want = TARGETS[key] if key in TARGETS else CALLS[key]
+def _kv_shape(keys, calls):
+    """The shape whose every hook target and call exists with the parameters the plugin reads, or (None, why)."""
+    errors = []
+    for shape in SHAPES:
+        try:
+            for key in keys + calls:
+                _check(key, shape=shape)
+            return shape, None
+        except Mismatch as e:
+            errors.append("%s: %s" % (SHAPE_RELEASE[shape], e))
+    return None, "SGLang is not a shape the plugin knows (%s)" % "; ".join(errors)
+
+
+def _check(key, shape):
+    table = TARGETS[shape] if key in TARGETS[shape] else CALLS[shape]
+    target, want = table[key]
     try:
         fn = pkgutil.resolve_name(target)
     except (ImportError, AttributeError, ValueError) as e:
@@ -128,7 +194,7 @@ def _check(key):
     got = params(fn)
     if got != want:
         raise Mismatch("%s takes (%s); the plugin knows (%s) from SGLang %s" % (
-            target, ", ".join(got), ", ".join(want), SGLANG_PINNED))
+            target, ", ".join(got), ", ".join(want), SHAPE_RELEASE[shape]))
 
 
 def _pool(device):
@@ -140,10 +206,56 @@ def _pool(device):
 
 # ------------------------------------------------------------------------------------------------------- kv cache
 
+def _layout_rule(tree):
+    """separate | fused | None, from the AST of a pool's _create_buffers (following a
+    self._create_buffers_normal() dispatch is the caller's job): fused when some torch.zeros call's size
+    starts with the literal 2 of SGLang's fused (2, padded, H, D) allocation (0.5.22+), separate when it
+    allocates K and V as their own zeros calls (0.5.14, 0.5.21), None when the source shows neither."""
+    fused = seen = False
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        name = n.func.id if isinstance(n.func, ast.Name) else (
+            n.func.attr if isinstance(n.func, ast.Attribute) else "")
+        if not name.endswith("zeros"):
+            continue
+        seen = True
+        arg = n.args[0] if n.args else None
+        if isinstance(arg, (ast.Tuple, ast.List)) and arg.elts \
+                and isinstance(arg.elts[0], ast.Constant) and arg.elts[0].value == 2:
+            fused = True
+    if not seen:
+        return None
+    return "fused" if fused else "separate"
+
+
+def _buffer_layout(pool_cls):
+    """The layout the pool class really allocates, read from its own _create_buffers source before the
+    KV budget is raised (the hook-signature shape says nothing about it: 0.5.21 has 0.5.23's signatures
+    but 0.5.14's separate K/V). None when the source cannot be read or shows no known pattern."""
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(pool_cls._create_buffers)))
+        if [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "_create_buffers_normal"]:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(pool_cls._create_buffers_normal)))
+        return _layout_rule(tree)
+    except Exception:
+        return None
+
+
+def _screen(name, ok, why):
+    """(ok(), why): an attribute the plugin cannot read counts as blocked, never as a placement."""
+    try:
+        return ok(), why
+    except Exception as e:
+        return False, "SGLang's %s cannot be read (%s: %s)" % (name, type(e).__name__, e)
+
+
 def _kv_blocked(mr):
-    """Why the KV pool of model runner `mr` must stay as SGLang sizes it, or None. The pool must come out as the
-    plain MHATokenToKVPool (_init_pools' last branch); anything the plugin cannot read counts as no."""
-    from sglang.srt.configs.model_config import is_deepseek_v4
+    """Why the KV pool of the sizing object `mr` (the model runner in 0.5.14, the KV configurator in 0.5.23) must
+    stay as SGLang sizes it, or None. The pool must come out as the plain MHATokenToKVPool (_init_pools' last
+    branch); anything the plugin cannot read counts as no."""
+    from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
     from sglang.srt.platforms import current_platform
 
     args = mr.server_args
@@ -161,6 +273,22 @@ def _kv_blocked(mr):
         (args.disaggregation_mode in (None, "null"), "PD disaggregation"),
         ("SGLANG_MOONCAKE_CUSTOM_MEM_POOL" not in os.environ, "a custom KV memory pool"),
     )
+    if S.shape != "0.5.14":
+        # 0.5.21+ builds another pool or layout for these, and the buffers hook needs equal K and V head sizes;
+        # screened before the budget is raised, so the placement turns off instead of the pool raising.
+        from sglang.srt.environ import envs
+        from sglang.srt.runtime_context import get_memory
+
+        checks += (
+            _screen("SGLANG_USE_HND_KVCACHE", lambda: not envs.SGLANG_USE_HND_KVCACHE.get(), "an HND KV cache"),
+            _screen("enable_page_major_kv_layout", lambda: not get_memory().enable_page_major_kv_layout,
+                    "the page-major KV layout"),
+            _screen("post_capture_kv_active", lambda: not mr.post_capture_kv_active, "post-capture KV sizing"),
+            _screen("model_config.head_dim", lambda: mr.model_config.head_dim == mr.model_config.v_head_dim,
+                    "K and V head sizes differ"),
+            _screen("model_config.hf_config", lambda: not is_minimax_sparse(mr.model_config.hf_config),
+                    "a MiniMax-sparse model"),
+        )
     for ok, why in checks:
         if not ok:
             return why
@@ -179,28 +307,68 @@ def _profile_hook(original, self, pre_model_load_memory):
 def _cap_hook(original, self, token_capacity):
     """--max-total-tokens holds the KV pool's device memory: when it binds, the pool takes the carveout's tokens on
     top of it. Without this the cap would bind on the measured memory plus the carveout, and the carveout would only
-    stand in for device memory. The PP ranks still agree in SGLang's own code, on the raised cap."""
+    stand in for device memory. A failure here leaves the pool no bigger than the cap: nothing over what SGLang
+    measured, so this hook may fail open."""
     with S.lock:
         lent = S.kv
-    cap = self.server_args.max_total_tokens
+    cap = _user_cap(self)
     if lent is None or cap is None or cap >= token_capacity:
         return original(self, token_capacity)
     try:
         from sglang.srt.model_executor.pool_configurator import create_memory_pool_configurator
 
-        extra = create_memory_pool_configurator(self).calculate_pool_sizes(S.kv_counted, 1).max_total_num_tokens
+        page = 1 if S.shape == "0.5.14" else self.page_size
+        extra = create_memory_pool_configurator(self).calculate_pool_sizes(S.kv_counted, page).max_total_num_tokens
     except Exception as e:
         log.warning("spark-attic: max_total_tokens=%d caps the KV pool with the carveout in it, which then only "
                     "stands in for device memory: %s: %s", cap, type(e).__name__, e)
         return original(self, token_capacity)
-    self.server_args.max_total_tokens = min(cap + extra, token_capacity)
-    try:
+    with _held_cap(self, min(cap + extra, token_capacity)):
         out = original(self, token_capacity)
-    finally:
-        self.server_args.max_total_tokens = cap
     log.info("spark-attic: max_total_tokens=%d holds the KV pool's device memory; the display carveout (%d MiB) adds "
              "%d tokens: %d", cap, S.kv_counted // MIB, out - cap, out)
     return out
+
+
+def _user_cap(mr):
+    """The --max-total-tokens the engine reads: server_args in 0.5.14, the schedule in 0.5.23."""
+    if S.shape == "0.5.23":
+        from sglang.srt.runtime_context import get_schedule
+
+        return get_schedule().max_total_tokens
+    return mr.server_args.max_total_tokens
+
+
+@contextmanager
+def _held_cap(mr, value):
+    """Point the cap the engine reads at `value` for the block, each version through its own API:
+    0.5.14 writes server_args; 0.5.23's schedule bag allows the write (a msgspec Struct); 0.5.21's
+    runtime context made the bag read-only - its scoped .override(**kw) is the API for exactly this
+    (set, run the block, restore, all validated)."""
+    if S.shape == "0.5.14":
+        saved, args = mr.server_args.max_total_tokens, mr.server_args
+        args.max_total_tokens = value
+        try:
+            yield
+        finally:
+            args.max_total_tokens = saved
+    else:
+        from sglang.srt.runtime_context import get_schedule
+
+        bag = get_schedule()
+        try:
+            hold = bag.override
+        except AttributeError:
+            # a schedule bag without the override primitive (a plain namespace): the direct write
+            saved = bag.max_total_tokens
+            bag.max_total_tokens = value
+            try:
+                yield
+            finally:
+                bag.max_total_tokens = saved
+        else:
+            with hold(max_total_tokens=value):
+                yield
 
 
 def _kv_lend(mr):
@@ -212,6 +380,13 @@ def _kv_lend(mr):
         why = "SGLang's model runner is not the one the plugin knows (%s)" % e
     except Exception as e:
         why = "%s: %s" % (type(e).__name__, e)
+    if not why:
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        S.layout = _buffer_layout(MHATokenToKVPool)
+        if S.layout is None:
+            why = ("the KV pool's _create_buffers does not show an allocation pattern the plugin knows "
+                   "(separate K and V buffers, or the fused (2, ...) allocation)")
     if why:
         log.warning("spark-attic: KV placement off: %s", why)
         return 0
@@ -273,19 +448,29 @@ def _agree(n):
         return 0
 
 
-def _pools_hook(original, self):
-    try:
-        return original(self)
-    finally:
-        with S.lock:
-            lent, S.kv = S.kv, None
-            if lent is not None:
-                S.kv_done = True
-        if lent is not None:  # the pool was not the kind the plugin fills
-            lent.release()
-            give_back(S)
-            log.warning("spark-attic: the KV pool (%s) took no carveout; it is %d MiB over the memory SGLang "
-                        "measured", type(getattr(self, "token_to_kv_pool", None)).__name__, S.kv_counted // MIB)
+def _over_budget(what):
+    """The line a post-raise failure leaves in the log. Falling back would leave the engine allocating a KV pool
+    above the memory it measured, so the caller raises instead; this says why, and what to do."""
+    log.error("spark-attic: %s, %d MiB more than the memory SGLang measured; not falling back: the KV budget was "
+              "already raised, so SGLang would overcommit its device memory. Turn the plugin off "
+              "(SPARK_ATTIC_PLACE=off) and restart SGLang, or fix the cause logged above.", what,
+              S.kv_counted // MIB)
+
+
+def _pools_hook(original, self, *args, **kwargs):
+    out = original(self, *args, **kwargs)
+    with S.lock:
+        lent, S.kv = S.kv, None
+        if lent is not None:
+            S.kv_done = True
+    if lent is not None:  # the pool was not the kind the plugin fills
+        lent.release()
+        give_back(S)
+        pool = getattr(out, "token_to_kv_pool", None) if S.shape == "0.5.23" else getattr(self, "token_to_kv_pool",
+                                                                                          None)
+        _over_budget("the KV pool (%s) took no carveout" % type(pool).__name__)
+        raise Mismatch("the KV pool (%s) took no carveout" % type(pool).__name__)
+    return out
 
 
 def _buffers_hook(original, self):
@@ -293,49 +478,83 @@ def _buffers_hook(original, self):
 
     with S.lock:
         lent = S.kv
-        usable = (lent is not None and type(self) is MHATokenToKVPool and self.kv_cache_layout == "nhd"
-                  and not self.enable_custom_mem_pool)
+        usable = lent is not None and type(self) is MHATokenToKVPool and self.kv_cache_layout == "nhd" \
+            and not self.enable_custom_mem_pool
+        if S.shape != "0.5.14":
+            usable = usable and not self.is_quantized_kv_cache and not self.post_capture_active \
+                and self.head_dim == self.v_head_dim and not self.use_hnd
         if usable:
             S.kv, S.kv_done = None, True
     if not usable:
         return original(self)
+    m = None
     try:
         dev = device_index(self.device)
-        layers = self.layer_num
-        k = (self.size + self.page_size, self.head_num, self.head_dim)
-        v = (self.size + self.page_size, self.head_num, self.v_head_dim)
-        expected = [k] * layers + [v] * layers  # _create_buffers' torch.zeros calls, in order
         item = self.store_dtype.itemsize
-        sizes = [_numel(s) * item for s in expected]
+        layers = self.layer_num
+        if S.layout == "separate":
+            # the pool allocates K and V as their own zeros calls per layer, K's for all layers first
+            # (0.5.14's mixin pool, 0.5.21's plain NHD pool)
+            k = (self.size + self.page_size, self.head_num, self.head_dim)
+            v = (self.size + self.page_size, self.head_num, self.v_head_dim)
+            expected = [k] * layers + [v] * layers  # _create_buffers' torch.zeros calls, in order
+            sizes = [_numel(s) * item for s in expected]
+        else:
+            # the fused layout (0.5.22+): K and V of a layer in one (2, padded, H, D) allocation, and the
+            # pool keeps buf[0, :rows] and buf[1, :rows] views of it
+            rows = self.size + self.page_size
+            padded = rows if self.use_hnd else -(-rows // self.page_size) * self.page_size
+            fused = (2, padded, self.head_num, self.head_dim)
+            expected = [fused] * layers
+            sizes = [_numel(fused) * item] * layers
         plan = tail_plan(sizes, lent.size)
         m = S.pool.map(plan.front, [lent])
         m.zero()  # SGLang's own buffers start zeroed
     except Exception as e:
+        if m is not None:
+            m.close()
         lent.release()
         give_back(S)
-        log.warning("spark-attic: %s: %s; SGLang allocates the whole KV pool in device memory, %d MiB more than the "
-                    "memory it measured", type(e).__name__, e, S.kv_counted // MIB)
-        return original(self)
+        _over_budget("%s: %s" % (type(e).__name__, e))
+        raise
     mode = _zeros_mode()(expected, sizes, self.store_dtype, dev, plan, m)
     try:
         with mode:
             out = original(self)
-    finally:
-        if mode.handed:
-            S.keep.append(m)
-        else:  # nothing points into the mapping: give it back now
-            m.close()
-            give_back(S)
-    given = {id(t) for t in mode.handed}
-    kept = sum(1 for t in list(self.k_buffer) + list(self.v_buffer) if id(t) in given)
-    if mode.miss or kept != len(expected) - plan.first:
-        log.warning("spark-attic: SGLang allocated its KV buffers differently than planned (%s); %d of %d buffers "
-                    "are in the carveout, up to %d MiB of it unused and the pool that much over the memory SGLang "
-                    "measured", mode.miss or "buffers replaced", kept, len(expected) - plan.first,
-                    S.kv_counted // MIB)
-    else:
+    except Exception as e:
+        m.close()
+        give_back(S)
+        _over_budget("the KV buffers could not be placed (%s: %s)" % (type(e).__name__, e))
+        raise
+    if mode.handed:
+        S.keep.append(m)
+    else:  # nothing points into the mapping: give it back now
+        m.close()
+        give_back(S)
+    if not mode.handed or mode.miss:
+        _over_budget("SGLang allocated its KV buffers differently than planned (%s)" % (mode.miss or "no buffers"))
+        raise Mismatch(mode.miss or "no buffers handed")
+    if S.layout == "separate":
+        given = {id(t) for t in mode.handed}
+        kept = sum(1 for t in list(self.k_buffer) + list(self.v_buffer) if id(t) in given)
+        if mode.miss or kept != len(expected) - plan.first:
+            _over_budget("SGLang allocated its KV buffers differently than planned (%s); %d of %d buffers are in "
+                         "the carveout" % (mode.miss or "buffers replaced", kept, len(expected) - plan.first))
+            raise Mismatch(mode.miss or "buffers replaced")
         log.info("spark-attic: KV buffers %d-%d of %d (K then V, by layer) in the display carveout (%d MiB), %d MiB "
                  "of device memory glued before it", plan.first, len(expected) - 1, len(expected),
+                 plan.attic_used // MIB, plan.front // MIB)
+    elif S.layout == "fused":
+        half = sizes[0] // 2
+        for i in range(plan.first, layers):
+            at = m.ptr + plan.offsets[i - plan.first]
+            if self.k_buffer[i].data_ptr() != at or self.v_buffer[i].data_ptr() != at + half:
+                _over_budget("SGLang's KV buffers %d do not point into the mapping (K at %x, V at %x, expected "
+                             "%x and %x)" % (i, self.k_buffer[i].data_ptr(), self.v_buffer[i].data_ptr(), at,
+                                             at + half))
+                raise Mismatch("KV buffers outside the mapping")
+        log.info("spark-attic: KV buffers %d-%d of %d (K and V fused, by layer) in the display carveout (%d MiB), "
+                 "%d MiB of device memory glued before it", plan.first, layers - 1, layers,
                  plan.attic_used // MIB, plan.front // MIB)
     return out
 

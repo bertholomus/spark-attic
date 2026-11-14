@@ -1,0 +1,40 @@
+{
+  "areas": {
+    "daemon": [
+      "src/",
+      "systemd/",
+      "sysctl/",
+      "STATUS-FILE.md"
+    ],
+    "scripts": [
+      "scripts/"
+    ],
+    "python": [
+      "python/"
+    ],
+    "tests": [
+      "tests/"
+    ],
+    "build": [
+      "Makefile"
+    ],
+    "docs": [
+      "README.md",
+      "INSTALL.md",
+      "RELEASE-NOTES-0.1.0.md",
+      "CONTRIBUTING.md",
+      "AGENTS.md"
+    ]
+  },
+  "areaIds": {
+    "daemon": 1,
+    "scripts": 2,
+    "python": 3,
+    "tests": 4,
+    "build": 5,
+    "docs": 6
+  },
+  "maxClaimsPerUser": 3,
+  "idleDays": 7,
+  "proposalDays": 7
+}

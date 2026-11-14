@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright 2026 bertholomus
 """test_vllm_plugin.py: spark_attic's vLLM plugin on a host with no GPU and no vLLM. A stand-in vLLM tree (files in a
-temp dir, imported for real, so the after-import hooks run as in vLLM) carries the four functions the plugin wraps,
-with vLLM 0.24.0's parameters and a pocket version of their logic; a stand-in torch keeps tensor bytes in host memory
-or, for the carveout, in the fake libcuda's. atticd runs with the fake RM shim, as in test_python.py.
+temp dir, imported for real, so the after-import hooks run as in vLLM) carries the functions the plugin wraps, with
+the parameters of the vLLM shape it stands for and a pocket version of their logic; a stand-in torch keeps tensor
+bytes in host memory or, for the carveout, in the fake libcuda's. atticd runs with the fake RM shim, as in
+test_python.py. Both supported shapes run: the 0.24 tree (the runner's _allocate_kv_cache_tensors, one torch.zeros
+per KV tensor) and the 0.32 tree (utils.allocate_kv_cache, one backing tensor for the whole cache).
 
-    python3 -I tests/test_vllm_plugin.py --bin build/host [--vllm-src cache/upstream/vllm-0.24.0]
+    python3 -I tests/test_vllm_plugin.py --bin build/host [--vllm-src DIR]...
 
---vllm-src adds the check that vLLM's own source still has what the plugin wraps (parameters, KVCacheTensor's fields,
-the calls the plugin relies on); without it that case is skipped.
+--vllm-src (repeatable) adds the check that a real vLLM source tree still has what the plugin wraps for its shape
+(parameters, KVCacheTensor's fields, the calls the plugin relies on); without it that case is skipped.
 """
 import argparse
 import ast
@@ -34,7 +36,7 @@ from spark_attic import _cuda, _place, vllm_plugin  # noqa: E402
 from fake_torch import TORCH, Device, Model  # noqa: E402
 
 SMALL = {"ATTIC_FAKE_REGION": "0x280000000:0x4000000"}  # 62 MiB free in one run
-VLLM_SRC = None
+VLLM_SRCS = []
 
 
 class Logs(logging.Handler):
@@ -134,6 +136,83 @@ def tree(attn_params="kv_cache_config, shared_layers, device", extra_field=""):
     }
 
 
+KV_IFACE_32 = '''
+from dataclasses import dataclass, field
+
+@dataclass
+class KVCacheTensor:
+    size: int
+    layers: list
+    layer_stride: int
+    block_stride: int
+    offset: int = 0
+    host_resident: bool = False
+
+@dataclass
+class KVCacheConfig:
+    num_blocks: int
+    kv_cache_tensors: list
+'''
+UTILS_32 = '''import torch
+
+
+def allocate_kv_cache(kv_cache_config, device, layout, kernel_block_sizes=None):
+    sizes = {t.size for t in kv_cache_config.kv_cache_tensors}
+    assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
+    buf = torch.zeros(sizes.pop(), dtype=torch.int8, device=device)
+    out = {}
+    for t in kv_cache_config.kv_cache_tensors:
+        for name in t.layers:
+            out[name] = buf
+    return out
+'''
+RUNNER_V1_32 = '''import torch
+
+from vllm.v1.worker.utils import allocate_kv_cache
+
+
+class GPUModelRunner:
+''' + RUNNER_COMMON + '''
+    def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
+        return allocate_kv_cache(kv_cache_config, self.device, None, kernel_block_sizes)
+'''
+ATTN_32 = '''import torch
+
+from vllm.v1.worker.utils import allocate_kv_cache
+
+
+def init_kv_cache(forward_context, kv_cache_config, device, kernel_block_sizes, vllm_config):
+    return allocate_kv_cache(kv_cache_config, device, None, kernel_block_sizes)
+'''
+RUNNER_V2_32 = '''import torch
+
+from vllm.v1.worker.gpu.attn_utils import init_kv_cache
+
+
+class GPUModelRunner:
+''' + RUNNER_COMMON + '''
+    def initialize_kv_cache(self, kv_cache_config):
+        return init_kv_cache([], kv_cache_config, self.device, [], None)
+'''
+
+
+def tree32(extra_field="", utils_params=None):
+    utils = UTILS_32 if utils_params is None else \
+        "import torch\n\n\ndef allocate_kv_cache(%s):\n    raise AssertionError('not the shape the plugin wraps')\n" \
+        % utils_params
+    return {
+        "vllm/__init__.py": PKG, "vllm/v1/__init__.py": PKG, "vllm/v1/worker/__init__.py": PKG,
+        "vllm/v1/worker/gpu/__init__.py": PKG,
+        "vllm/v1/kv_cache_interface.py": KV_IFACE_32 if not extra_field else KV_IFACE_32.replace(
+            "    block_stride: int\n", "    block_stride: int" + extra_field + "\n"),
+        "vllm/v1/worker/gpu_worker.py": WORKER_SRC,
+        "vllm/v1/worker/utils.py": utils,
+        "vllm/v1/worker/gpu_model_runner.py": RUNNER_V1_32,
+        "vllm/v1/worker/gpu/attn_utils.py": ATTN_32,
+        "vllm/v1/worker/gpu/model_runner.py": RUNNER_V2_32,
+    }
+
+
 class Vllm:
     """A fresh stand-in vLLM on sys.path, a fresh plugin state, register() called as vLLM would."""
 
@@ -159,6 +238,7 @@ class Vllm:
         self.au = importlib.import_module("vllm.v1.worker.gpu.attn_utils")
         self.r2 = importlib.import_module("vllm.v1.worker.gpu.model_runner")
         self.kv = importlib.import_module("vllm.v1.kv_cache_interface")
+        self.utils = sys.modules.get("vllm.v1.worker.utils")  # the 0.32 shape only
 
     def worker(self, runner, budget, sleep=False, connector=None):
         cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(enable_sleep_mode=sleep),
@@ -168,6 +248,13 @@ class Vllm:
     def config(self, sizes, packed=()):
         ts = [self.kv.KVCacheTensor(size=s, shared_by=["layer.%d" % i], block_stride=(s if i in packed else 0))
               for i, s in enumerate(sizes)]
+        return self.kv.KVCacheConfig(num_blocks=1, kv_cache_tensors=ts)
+
+    def config32(self, size, layers=6, layer_stride=None, block_stride=0):
+        """A 0.32-shaped config: every tensor one backing of `size`, its layers strided inside it."""
+        ts = [self.kv.KVCacheTensor(size=size, layers=["layer.%d" % i for i in range(layers)],
+                                    layer_stride=layer_stride if layer_stride is not None else size // layers,
+                                    block_stride=block_stride)]
         return self.kv.KVCacheConfig(num_blocks=1, kv_cache_tensors=ts)
 
     def done(self):
@@ -417,11 +504,13 @@ def case_drift(rig):
     rig.start(env=SMALL)
     v = Vllm(env_for(rig), tree(attn_params="kv_cache_config, device, shared_layers=None"))
     try:
-        check(not getattr(v.au._allocate_kv_cache, "__spark_attic__", False)
-              and LOGS.has("takes (kv_cache_config, device, shared_layers)"), "a changed signature is not wrapped")
+        check(not getattr(v.au._allocate_kv_cache, "__spark_attic__", False), "a changed signature is not wrapped")
         w = v.worker(v.r2.GPUModelRunner(Device("cuda:0")), 100 * MIB)
-        check(w.determine_available_memory() == 100 * MIB and LOGS.has("V2 KV allocation is not wrapped"),
-              "so the V2 runner gets no carveout")
+        got = w.determine_available_memory()
+        check(got == 100 * MIB, "so the V2 runner gets no carveout: %d MiB" % (got // MIB))
+        check(sum(1 for l in LOGS.lines if "KV placement off" in l) == 1, "one line: %r" % LOGS.lines)
+        check(LOGS.has("takes (kv_cache_config, device, shared_layers)")
+              and LOGS.has("V2 KV allocation is not wrapped"), "the line says why: %r" % LOGS.lines)
         check(lent(rig) == 0, "nothing lent")
     finally:
         v.done()
@@ -429,16 +518,128 @@ def case_drift(rig):
     try:
         r = v.r1.GPUModelRunner(Device("cuda:0"))
         w = v.worker(r, 100 * MIB)
-        check(w.determine_available_memory() == 162 * MIB, "V1, 62 MiB counted in")
+        check(w.determine_available_memory() == 100 * MIB and lent(rig) == 0
+              and LOGS.has("fields the plugin does not know: stream"),
+              "KVCacheTensor grew a field: the budget stays as vLLM measured it, nothing lent, one line")
         out = r.initialize_kv_cache_tensors(v.config([27 * MIB] * 6), [16])
-        check(all(t.kind == "buf" for t in out.values()) and LOGS.has("fields the plugin does not know: stream")
-              and LOGS.has("62 MiB more than the memory it measured"),
-              "KVCacheTensor grew a field: vLLM allocates it all, and the log says by how much it overshoots")
+        check(all(t.kind == "buf" for t in out.values()), "and vLLM allocates it all itself")
         inf = wait_free(rig.sock, 62 * MIB)
-        check(inf and inf["free"] == 62 * MIB and vllm_plugin.S.pool is None,
-              "nothing else borrowed: the connection closed, the unused slice back at once: %r" % inf)
+        check(inf and inf["free"] == 62 * MIB and vllm_plugin.S.pool is None, "nothing was ever borrowed: %r" % inf)
     finally:
         v.done()
+    v = Vllm(env_for(rig), tree32(utils_params="kv_cache_config, device"))
+    try:
+        w = v.worker(v.r1.GPUModelRunner(Device("cuda:0")), 100 * MIB)
+        check(w.determine_available_memory() == 100 * MIB and lent(rig) == 0,
+              "an engine no shape knows: the budget stays as vLLM measured it")
+        check(sum(1 for l in LOGS.lines if "KV placement off" in l) == 1
+              and LOGS.has("allocates its KV cache in a way the plugin does not wrap"),
+              "one clear line: %r" % [l for l in LOGS.lines if "off" in l])
+    finally:
+        v.done()
+
+
+def case_kv_v3(rig):
+    """The 0.32 shape: one backing allocation for the whole cache, its tail in the carveout."""
+    rig.start(env=SMALL)
+    v = Vllm(env_for(rig), tree32())
+    try:
+        check(getattr(v.utils.allocate_kv_cache, "__spark_attic__", False)
+              and getattr(v.gw.Worker.determine_available_memory, "__spark_attic__", False)
+              and not getattr(v.gw.Worker.load_model, "__spark_attic__", False),
+              "0.32: utils.allocate_kv_cache and the worker hook wrapped, load_model left alone")
+        check(not getattr(v.r1.GPUModelRunner, "_allocate_kv_cache_tensors", None), "no 0.24 hook on this engine")
+        w = v.worker(v.r1.GPUModelRunner(Device("cuda:0")), 100 * MIB)
+        got = w.determine_available_memory()
+        check(got == 162 * MIB and w.available_kv_cache_memory_bytes == 162 * MIB,
+              "100 MiB measured + the 62 MiB lent: %d MiB" % (got // MIB))
+        check(lent(rig) == 62 * MIB, "atticd lent 62 MiB")
+        out = w.model_runner.initialize_kv_cache_tensors(v.config32(140 * MIB), [16])
+        m = vllm_plugin.S.keep[0]
+        buf = out["layer.0"]
+        check(all(out["layer.%d" % i] is buf for i in range(6)), "every layer views the one backing")
+        check(buf.kind == "va" and buf.va == m.ptr and m.size == 140 * MIB and m.attic_bytes == 62 * MIB,
+              "the backing spans 78 MiB of device memory + the 62 MiB carveout at its tail: %r %r" % (m, buf))
+        check(m.read(0, 4096) == bytes(4096) and m.read(m.size - 4096, 4096) == bytes(4096), "the mapping is zeroed")
+        seam = TORCH.zeros(4096)
+        data = pattern(4096, 3)
+        ctypes.memmove(ctypes.addressof(seam.buf), data, 4096)
+        buf.view((140 * MIB,))[78 * MIB - 2048:78 * MIB + 2048].put(data)
+        check(m.read(78 * MIB - 2048, 4096) == data, "a write across the device/carveout seam reads back")
+        LOGS.lines.clear()
+        check(w.determine_available_memory() == 100 * MIB and LOGS.has("after allocating"),
+              "sized again after the allocation: no carveout")
+    finally:
+        v.done()
+    inf = wait_free(rig.sock, 62 * MIB)
+    check(inf and inf["free"] == 62 * MIB, "closed: all given back: %r" % inf)
+
+
+def case_s2_v1(rig):
+    """The budget was raised and the placement then fails: the engine stops, it never allocates the raise."""
+    rig.start(env=SMALL)
+    v = Vllm(env_for(rig))
+    try:
+        r = v.r1.GPUModelRunner(Device("cuda:0"))
+        w = v.worker(r, 100 * MIB)
+        check(w.determine_available_memory() == 162 * MIB and lent(rig) == 62 * MIB, "budget raised, carveout lent")
+        raised = None
+        try:
+            r.initialize_kv_cache_tensors(v.config([]), [16])  # no tensors: nothing to place
+        except Exception as e:
+            raised = e
+        check(raised is not None, "the placement fails after the raise: the engine stops coming up")
+        check(LOGS.has("not falling back") and LOGS.has("no KV tensors to place"),
+              "one line says why and what to do: %r" % [l for l in LOGS.lines if "not falling" in l])
+        inf = wait_free(rig.sock, 62 * MIB)
+        check(inf and inf["free"] == 62 * MIB and not vllm_plugin.S.keep,
+              "the unused carveout went back at once: %r" % inf)
+    finally:
+        v.done()
+
+
+def case_s2_v3(rig):
+    """The 0.32 budget was raised and the backing cannot be placed: the engine stops, it never allocates the raise."""
+    rig.start(env=SMALL)
+    v = Vllm(env_for(rig), tree32())
+    try:
+        w = v.worker(v.r1.GPUModelRunner(Device("cuda:0")), 100 * MIB)
+        check(w.determine_available_memory() == 162 * MIB and lent(rig) == 62 * MIB, "budget raised, carveout lent")
+        kv = v.kv
+        cfg = kv.KVCacheConfig(num_blocks=1, kv_cache_tensors=[
+            kv.KVCacheTensor(size=100 * MIB, layers=["a"], layer_stride=100 * MIB, block_stride=0),
+            kv.KVCacheTensor(size=40 * MIB, layers=["b"], layer_stride=40 * MIB, block_stride=0)])
+        raised = None
+        try:
+            w.model_runner.initialize_kv_cache_tensors(cfg, [16])
+        except Exception as e:
+            raised = e
+        check(raised is not None, "two backing sizes: the placement fails after the raise, the engine stops")
+        check(LOGS.has("not falling back") and LOGS.has("do not share one backing allocation"),
+              "one line says why and what to do: %r" % [l for l in LOGS.lines if "not falling" in l])
+        inf = wait_free(rig.sock, 62 * MIB)
+        check(inf and inf["free"] == 62 * MIB and not vllm_plugin.S.keep,
+              "the unused carveout went back at once: %r" % inf)
+    finally:
+        v.done()
+    rig.start(env=SMALL)
+    v = Vllm(env_for(rig), tree32())
+    try:
+        w = v.worker(v.r1.GPUModelRunner(Device("cuda:0")), 100 * MIB)
+        check(w.determine_available_memory() == 162 * MIB, "raised again")
+        kv = v.kv
+        cfg = kv.KVCacheConfig(num_blocks=1, kv_cache_tensors=[
+            kv.KVCacheTensor(size=100 * MIB, layers=["a", "b"], layer_stride=50 * MIB, block_stride=0,
+                             host_resident=True)])
+        raised = None
+        try:
+            w.model_runner.initialize_kv_cache_tensors(cfg, [16])
+        except Exception:
+            raised = True
+        check(raised and LOGS.has("host resident"), "a host-resident group: the carveout is device memory, off")
+    finally:
+        v.done()
+    wait_free(rig.sock, 62 * MIB)
 
 
 # Decorators that keep a function's parameters (functools.wraps), so the plugin reads its parameters through them
@@ -446,13 +647,13 @@ KEEP_PARAMS = {"torch.inference_mode()"}
 
 
 def case_upstream(rig):
-    """vLLM's own source (--vllm-src) still has what the plugin wraps."""
-    if not VLLM_SRC:
+    """vLLM's own source (--vllm-src, repeatable) still has what the plugin wraps for its shape."""
+    if not VLLM_SRCS:
         print("  skip: no --vllm-src")
         return
 
-    def parse(mod):
-        with open(os.path.join(VLLM_SRC, *mod.split(".")) + ".py") as f:
+    def parse(src, mod):
+        with open(os.path.join(src, *mod.split(".")) + ".py") as f:
             return ast.parse(f.read())
 
     def find(t, dotted):
@@ -464,51 +665,79 @@ def case_upstream(rig):
                 return None
         return node
 
-    for (mod, qual), want in vllm_plugin.EXPECTED.items():
-        fn = find(parse(mod), qual)
-        a = fn.args if fn else None
-        got = [x.arg for x in a.posonlyargs + a.args + ([a.vararg] if a.vararg else []) + a.kwonlyargs
-               + ([a.kwarg] if a.kwarg else [])] if a else None
-        check(got == want, "%s.%s: (%s) as the plugin expects: %r" % (mod, qual, ", ".join(want), got))
-        decos = [ast.unparse(d) for d in fn.decorator_list] if fn else []
-        check(set(decos) <= KEEP_PARAMS, "%s.%s: decorators that keep its parameters, read through: %r"
-              % (mod, qual, decos))
-    kv = find(parse("vllm.v1.kv_cache_interface"), "KVCacheTensor")
-    fields = {n.target.id for n in kv.body if isinstance(n, ast.AnnAssign)}
-    check(fields == vllm_plugin.KV_TENSOR_FIELDS, "KVCacheTensor's fields: %r" % fields)
-
     def names(fn):
         return {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)} | {
             n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
-    check("_allocate_kv_cache" in names(find(parse(vllm_plugin.ATTN_V2), "init_kv_cache")),
-          "attn_utils.init_kv_cache calls _allocate_kv_cache")
-    check("_allocate_kv_cache_tensors" in names(find(parse(vllm_plugin.RUNNER_V1),
-                                                     "GPUModelRunner.initialize_kv_cache_tensors")),
-          "V1 initialize_kv_cache_tensors calls _allocate_kv_cache_tensors")
-    v2 = parse(vllm_plugin.RUNNER_V2)
-    check(any(isinstance(n, ast.ImportFrom) and n.module == vllm_plugin.ATTN_V2
-              and "init_kv_cache" in [a.name for a in n.names] for n in ast.walk(v2)),
-          "the V2 runner imports init_kv_cache from attn_utils")
-    check("init_kv_cache" in names(find(v2, "GPUModelRunner.initialize_kv_cache")),
-          "and calls it from initialize_kv_cache")
-    w = find(parse(vllm_plugin.WORKER), "Worker.determine_available_memory")
-    check("available_kv_cache_memory_bytes" in names(w), "Worker keeps available_kv_cache_memory_bytes")
-    for runner in (vllm_plugin.RUNNER_V1, vllm_plugin.RUNNER_V2):
-        lm = find(parse(runner), "GPUModelRunner.load_model")
-        check(lm is not None and "model_memory_usage" in names(lm), "%s.load_model sets model_memory_usage" % runner)
+
+    for src in VLLM_SRCS:
+        tag = os.path.basename(src.rstrip("/"))
+        runner1 = parse(src, vllm_plugin.RUNNER_V1)
+        shape = "0.24" if find(runner1, "GPUModelRunner._allocate_kv_cache_tensors") else "0.32"
+        check(shape in vllm_plugin.EXPECTED, "%s: a shape the plugin knows (%s)" % (tag, shape))
+        for (mod, qual), want in vllm_plugin.EXPECTED[shape].items():
+            fn = find(parse(src, mod), qual)
+            a = fn.args if fn else None
+            got = [x.arg for x in a.posonlyargs + a.args + ([a.vararg] if a.vararg else []) + a.kwonlyargs
+                   + ([a.kwarg] if a.kwarg else [])] if a else None
+            check(got == want, "%s: %s.%s: (%s) as the plugin expects: %r" % (tag, mod, qual, ", ".join(want), got))
+            decos = [ast.unparse(d) for d in fn.decorator_list] if fn else []
+            check(set(decos) <= KEEP_PARAMS, "%s: %s.%s: decorators that keep its parameters, read through: %r"
+                  % (tag, mod, qual, decos))
+        kv = find(parse(src, "vllm.v1.kv_cache_interface"), "KVCacheTensor")
+        fields = {n.target.id for n in kv.body if isinstance(n, ast.AnnAssign)}
+        check(fields == vllm_plugin.KV_TENSOR_FIELDS[shape], "%s: KVCacheTensor's fields: %r" % (tag, fields))
+        w = find(parse(src, vllm_plugin.WORKER), "Worker.determine_available_memory")
+        check("available_kv_cache_memory_bytes" in names(w), "%s: Worker keeps available_kv_cache_memory_bytes" % tag)
+        for runner in (vllm_plugin.RUNNER_V1, vllm_plugin.RUNNER_V2):
+            lm = find(parse(src, runner), "GPUModelRunner.load_model")
+            check(lm is not None and "model_memory_usage" in names(lm),
+                  "%s: %s.load_model sets model_memory_usage" % (tag, runner))
+        if shape == "0.24":
+            check("_allocate_kv_cache" in names(find(parse(src, vllm_plugin.ATTN_V2), "init_kv_cache")),
+                  "%s: attn_utils.init_kv_cache calls _allocate_kv_cache" % tag)
+            check("_allocate_kv_cache_tensors" in names(find(parse(src, vllm_plugin.RUNNER_V1),
+                                                             "GPUModelRunner.initialize_kv_cache_tensors")),
+                  "%s: V1 initialize_kv_cache_tensors calls _allocate_kv_cache_tensors" % tag)
+            v2 = parse(src, vllm_plugin.RUNNER_V2)
+            check(any(isinstance(n, ast.ImportFrom) and n.module == vllm_plugin.ATTN_V2
+                      and "init_kv_cache" in [a.name for a in n.names] for n in ast.walk(v2)),
+                  "%s: the V2 runner imports init_kv_cache from attn_utils" % tag)
+            check("init_kv_cache" in names(find(v2, "GPUModelRunner.initialize_kv_cache")),
+                  "%s: and calls it from initialize_kv_cache" % tag)
+        else:
+            alloc = find(parse(src, vllm_plugin.UTILS_V3), "allocate_kv_cache")
+            zeros = [n for n in ast.walk(alloc)
+                     if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "zeros"
+                     and isinstance(n.func.value, ast.Name) and n.func.value.id == "torch"]
+            check(len(zeros) == 1, "%s: allocate_kv_cache makes one backing allocation (%d torch.zeros)" % (tag, len(
+                zeros)))
+            asserts = [ast.unparse(n.test) for n in ast.walk(alloc) if isinstance(n, ast.Assert)]
+            check(any("len(sizes) == 1" in a for a in asserts),
+                  "%s: one backing is an assert in allocate_kv_cache: %r" % (tag, asserts))
+            for mod in (vllm_plugin.RUNNER_V1, vllm_plugin.ATTN_V2):
+                tree_ = parse(src, mod)
+                check(any(isinstance(n, ast.ImportFrom)
+                          and n.module and n.module.split(".")[-1] == "utils"
+                          and "allocate_kv_cache" in [a.name for a in n.names] for n in ast.walk(tree_)),
+                      "%s: %s imports allocate_kv_cache from %s" % (tag, mod, vllm_plugin.UTILS_V3))
+            check("allocate_kv_cache" in names(find(parse(src, vllm_plugin.ATTN_V2), "init_kv_cache")),
+                  "%s: attn_utils.init_kv_cache calls allocate_kv_cache" % tag)
+            check("allocate_kv_cache" in names(find(parse(src, vllm_plugin.RUNNER_V1),
+                                                    "GPUModelRunner.initialize_kv_cache_tensors")),
+                  "%s: V1 initialize_kv_cache_tensors calls allocate_kv_cache" % tag)
 
 
 CASES = [case_tail_plan, case_settings, case_entry_point, case_after_import, case_kv_v2, case_kv_v1_packed,
-         case_weights, case_weights_and_kv, case_fail_open, case_blocked, case_drift, case_upstream]
+         case_kv_v3, case_weights, case_weights_and_kv, case_fail_open, case_blocked, case_drift, case_s2_v1,
+         case_s2_v3, case_upstream]
 
 
 def main():
-    global VLLM_SRC
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default="build/host")
-    ap.add_argument("--vllm-src")
+    ap.add_argument("--vllm-src", action="append", default=[])
     a = ap.parse_args()
-    VLLM_SRC = a.vllm_src and os.path.isdir(a.vllm_src) and os.path.abspath(a.vllm_src)
+    VLLM_SRCS.extend(os.path.abspath(s) for s in a.vllm_src if os.path.isdir(s))
     bindir = os.path.abspath(a.bin)
     os.environ["SPARK_ATTIC_LIBCUDA"] = os.path.join(bindir, "fakecuda", "libcuda.so.1")
     sys.modules["torch"] = TORCH

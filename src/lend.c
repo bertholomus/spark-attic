@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "attic.h"
@@ -121,6 +122,13 @@ int ledger_save(const struct ledger *l, const char *path)
     FILE *f = fopen(tmp, "we");
     if (f == NULL)
         return -errno;
+    /* The ledger carries the carveout's physical addresses (mode list): root only, whatever the umask says. */
+    if (fchmod(fileno(f), 0600) != 0) {
+        int e = errno;
+        fclose(f);
+        unlink(tmp);
+        return -e;
+    }
     fprintf(f, "spark-attic ledger 1: base size pid start (runs lent or draining)\n");
     for (uint32_t i = 0; i < l->count;) {
         if (l->state[i] != SLICE_LENT && l->state[i] != SLICE_DRAINING) {

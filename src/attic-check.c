@@ -45,7 +45,35 @@
 #define CHUNK (64ull << 20)
 #define MiB(x) ((unsigned long long)((x) >> 20))
 
-static const char *sock_path = ATTIC_DEFAULT_SOCKET, *key = ATTIC_DEFAULT_KEY, *mode = "heap";
+static const char *sock_path = ATTIC_DEFAULT_SOCKET, *key = "", *mode = "heap";
+
+/* The first line of a key file, trimmed (atticd's --key-file reads the same shape). */
+static int read_key_file(const char *path)
+{
+    char buf[128];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "attic-check: cannot read a key from %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    ssize_t r = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (r < 0) {
+        fprintf(stderr, "attic-check: cannot read a key from %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    buf[r > 0 ? r : 0] = 0;
+    size_t len = strspn(buf, "\n\r \t");
+    memmove(buf, buf + len, r - len + 1);
+    len = strcspn(buf, "\n\r");
+    buf[len] = 0;
+    if (buf[0] == 0) {
+        fprintf(stderr, "attic-check: %s holds no key\n", path);
+        return -1;
+    }
+    key = strdup(buf);
+    return key ? 0 : -1;
+}
 static const char *iomem = "/proc/iomem", *meminfo = "/proc/meminfo", *report = NULL;
 static int device_ordinal = 0;
 
@@ -568,6 +596,10 @@ static int phase_hold(int close_first)
     }
     close(fd);
     uint32_t *buf = malloc(CHUNK);
+    if (buf == NULL) {
+        fprintf(stderr, "attic-check: out of memory for the %lu KiB hold buffer\n", (unsigned long)(CHUNK >> 10));
+        return 2;
+    }
     fill_host(buf, 0, CHUNK / 4, 0xcccc, 0);
     cu.htod(mp.va, buf, in.largest < CHUNK ? in.largest : CHUNK);
     cu.sync();
@@ -589,7 +621,8 @@ static int run_child(const char *phase, char *res, size_t cap)
     pid_t pid = fork();
     if (pid == 0) {
         dup2(p[1], 1);
-        char *argv[] = {"attic-check", "--phase", (char *)phase, "--socket", (char *)sock_path, "--key", (char *)key,
+        setenv("ATTIC_CHECK_KEY", key, 1); /* the key off the command line: /proc/<pid>/cmdline is world-readable (M3) */
+        char *argv[] = {"attic-check", "--phase", (char *)phase, "--socket", (char *)sock_path,
                         "--mode", (char *)mode, "--iomem", (char *)iomem, "--meminfo", (char *)meminfo, NULL};
         execv("/proc/self/exe", argv);
         _exit(127);
@@ -617,8 +650,9 @@ static pid_t start_holder(int close_first, char *line, size_t cap)
     pid_t pid = fork();
     if (pid == 0) {
         dup2(p[1], 1);
+        setenv("ATTIC_CHECK_KEY", key, 1); /* the key off the command line (M3) */
         char *argv[] = {"attic-check", "--phase", close_first ? "hold-close" : "hold", "--socket", (char *)sock_path,
-                        "--key", (char *)key, NULL};
+                        NULL};
         execv("/proc/self/exe", argv);
         _exit(127);
     }
@@ -717,6 +751,7 @@ int main(int argc, char **argv)
 {
     static const struct option opts[] = {
         {"socket", required_argument, 0, 's'}, {"key", required_argument, 0, 'k'},
+        {"key-file", required_argument, 0, 'K'},
         {"mode", required_argument, 0, 'm'},   {"report", required_argument, 0, 'r'},
         {"device", required_argument, 0, 'd'}, {"iomem", required_argument, 0, 'i'},
         {"meminfo", required_argument, 0, 'M'}, {"phase", required_argument, 0, 'p'},
@@ -728,6 +763,10 @@ int main(int argc, char **argv)
         switch (o) {
         case 's': sock_path = optarg; break;
         case 'k': key = optarg; break;
+        case 'K':
+            if (read_key_file(optarg) != 0)
+                return 2;
+            break;
         case 'm': mode = optarg; break;
         case 'r': report = optarg; break;
         case 'd': device_ordinal = atoi(optarg); break;
@@ -737,6 +776,15 @@ int main(int argc, char **argv)
         case 'S': status_only = 1; break;
         default: usage(); return 2;
         }
+    }
+    if (key[0] == 0) {
+        const char *e = getenv("ATTIC_CHECK_KEY"); /* how run_child hands the key to its phase children (M3) */
+        if (e != NULL && e[0] != 0)
+            key = e;
+    }
+    if (key[0] == 0) {
+        fprintf(stderr, "attic-check: no key: give --key or ATTIC_CHECK_KEY (atticd runs with no compiled-in default)\n");
+        return 2;
     }
     if (phase) {
         int rc = strcmp(phase, "full") == 0        ? phase_full()

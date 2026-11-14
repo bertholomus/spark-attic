@@ -18,6 +18,7 @@ import threading
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "python"))
 from test_server import FAILS, KEY, MIB, SLICE, Rig, check, wait_free  # noqa: E402
@@ -60,12 +61,18 @@ def pattern(n, seed):
 # ---------------------------------------------------------------------------------------------------------- cases
 
 def case_settings(rig):
-    s = Settings.from_env({})
-    check((s.sock, s.key, s.timeout) == ("/run/spark-attic/attic.sock", "spark-attic-1", 5.0), "defaults: %r" % (s,))
+    try:
+        Settings.from_env({})
+        check(False, "no key in the environment: from_env refuses")
+    except AtticError as e:
+        check("no key" in str(e), "no key in the environment: from_env refuses with why: %s" % e)
     s = Settings.from_env({"SPARK_ATTIC_SOCK": "/x/a.sock", "SPARK_ATTIC_KEY": "k1", "SPARK_ATTIC_TIMEOUT_MS": "250"})
     check((s.sock, s.key, s.timeout) == ("/x/a.sock", "k1", 0.25), "from the environment: %r" % (s,))
-    s = Settings.from_env({"SPARK_ATTIC_SOCK": "", "SPARK_ATTIC_KEY": ""})
-    check((s.sock, s.key) == ("/run/spark-attic/attic.sock", "spark-attic-1"), "empty means unset: %r" % (s,))
+    try:
+        Settings.from_env({"SPARK_ATTIC_SOCK": "", "SPARK_ATTIC_KEY": ""})
+        check(False, "empty means unset: still no key")
+    except AtticError as e:
+        check("no key" in str(e), "empty means unset: still no key: %s" % e)
     kf = os.path.join(rig.dir, "key")
     with open(kf, "w") as f:
         f.write("attic_0123abcd\n")
@@ -89,7 +96,7 @@ def case_settings(rig):
 def case_fail_open(rig):
     rig.start(env=SMALL)
     n = fds_open()
-    m = spark_attic.borrow(settings=Settings(sock=os.path.join(rig.dir, "none.sock")))
+    m = spark_attic.borrow(settings=Settings(sock=os.path.join(rig.dir, "none.sock"), key=KEY))
     check(m is None and "no atticd at" in LOGS.last(), "no daemon: None and why: %s" % LOGS.last())
     m = spark_attic.borrow(settings=settings(rig, key="not_the_key"))
     check(m is None and "wrong key" in LOGS.last(), "wrong key: None and why: %s" % LOGS.last())
@@ -115,6 +122,35 @@ def case_fail_open(rig):
     check(fds_open() == n, "no descriptor leaked: %d then %d" % (n, fds_open()))
 
 
+def case_unit(rig):
+    """systemd/attic.service: the hardening is there and the pieces atticd needs are not locked out (S5)."""
+    unit = {}
+    section = None
+    for line in open(os.path.join(ROOT, "systemd", "attic.service")):
+        line = line.strip()
+        if line.startswith("["):
+            section = line
+        elif "=" in line and section == "[Service]":
+            k, v = line.split("=", 1)
+            unit.setdefault(k, []).append(v)
+    check(unit.get("ExecStart") == ["/usr/local/sbin/atticd --socket /run/spark-attic/attic.sock --key-file "
+                                    "/etc/spark-attic/key --mode heap"], "ExecStart: key file, not a key: %r"
+          % unit.get("ExecStart"))
+    hardening = ["NoNewPrivileges", "PrivateTmp", "ProtectHome", "ProtectSystem", "ReadWritePaths",
+                 "ProtectKernelTunables", "ProtectKernelModules", "ProtectKernelLogs", "ProtectControlGroups",
+                 "ProtectClock", "ProtectHostname", "RestrictSUIDSGID", "LockPersonality", "RestrictAddressFamilies"]
+    missing = [k for k in hardening if k not in unit]
+    check(not missing, "the hardening lines are there (S5); missing: %r" % missing)
+    check(unit.get("ProtectSystem") == ["strict"] and unit.get("ReadWritePaths") == ["-/run/spark-attic"],
+          "the whole filesystem read-only except the runtime directory")
+    check(unit.get("RestrictAddressFamilies") == ["AF_UNIX"], "AF_UNIX is the only socket family")
+    check("User" not in unit and "CapabilityBoundingSet" not in unit and "DevicePolicy" not in unit
+          and "SystemCallFilter" not in unit and "ProtectProc" not in unit,
+          "and what is left off stays off (INSTALL section 5 says why): %r"
+          % [k for k in ("User", "CapabilityBoundingSet", "DevicePolicy", "SystemCallFilter", "ProtectProc")
+             if k in unit])
+
+
 def case_borrow(rig):
     rig.start(env=SMALL)
     s = settings(rig)
@@ -128,17 +164,31 @@ def case_borrow(rig):
         data = pattern(4096, off & 0xFF)
         m.write(off, data)
         check(m.read(off, 4096) == data, "written and read back at %d" % off)
-    m.zero()
-    check(m.read(m.size - 64, 64) == bytes(64), "zero() clears it")
     try:
         m.read(m.size - 1, 2)
         check(False, "a read past the end refused")
     except ValueError:
         pass
-    m.close()
+    m.close()  # closed without zero(): this holder's bytes stay in the slice
     check(m.closed and "closed" in repr(m), "closed: %r" % m)
     inf = wait_free(rig.sock, 62 * MIB)
     check(inf and inf["free"] == 62 * MIB, "close() gives it back: %r" % inf)
+    # the slice still holds the previous holder's bytes: Pool.map does not clear, so a raw borrow reads the
+    # pattern back (this is what makes the zeroing check below mean anything)
+    raw = spark_attic.Pool(settings=s).map(0, [62 * MIB])
+    check(raw.read(0, 4096) == pattern(4096, 0) and raw.read(30 * MIB + 12345, 4096) == pattern(4096, 57)
+          and raw.read(m.size - 4096, 4096) == pattern(4096, 0),
+          "the same slice raw (Pool.map): the previous holder's bytes are still there (S3)")
+    raw.close()
+    m = spark_attic.borrow(settings=s)  # borrow() zeroes the slice before returning it
+    check(m is not None and m.read(0, 4096) == bytes(4096) and m.read(30 * MIB + 12345, 4096) == bytes(4096)
+          and m.read(m.size - 4096, 4096) == bytes(4096),
+          "borrow() zeroes the slice: the previous holder's bytes are gone (S3)")
+    m.zero()
+    check(m.read(m.size - 64, 64) == bytes(64), "zero() clears it")
+    m.close()
+    inf = wait_free(rig.sock, 62 * MIB)
+    check(inf and inf["free"] == 62 * MIB, "the re-borrow is given back: %r" % inf)
     m = spark_attic.borrow(5 * MIB, settings=s)
     check(m is not None and m.size == 6 * MIB, "5 MiB asked: 6 MiB (whole slices): %r" % m)
     del m  # dropped without close(): the finalizer gives it back
@@ -248,7 +298,7 @@ def case_protocol(rig):
     n = fds_open()
     d = Scripted(path, [(b'{"ok":true,"size":4194304,"free":2097152,"largest":2097152}', 0),
                         (b'{"ok":true,"size":2097152}', 1)])
-    a = spark_attic.Attic(Settings(sock=path))
+    a = spark_attic.Attic(Settings(sock=path, key=KEY))
     check(a.info() == {"size": 4 * MIB, "free": 2 * MIB, "largest": 2 * MIB}, "info parsed")
     fd = a.alloc(SLICE)
     os.close(fd)
@@ -263,7 +313,7 @@ def case_protocol(rig):
     for body, nfds, want in bad:
         os.unlink(path)
         d = Scripted(path, [(body, nfds)])
-        a = spark_attic.Attic(Settings(sock=path, timeout=5.0))
+        a = spark_attic.Attic(Settings(sock=path, key=KEY, timeout=5.0))
         try:
             a.alloc(SLICE)
             check(False, "reply %r refused" % body)
@@ -273,7 +323,7 @@ def case_protocol(rig):
         d.close()
     os.unlink(path)
     d = Scripted(path, [])
-    a = spark_attic.Attic(Settings(sock=path))
+    a = spark_attic.Attic(Settings(sock=path, key=KEY))
     try:
         a.alloc(3 * MIB)
         check(False, "3 MiB is not whole slices")
@@ -284,7 +334,7 @@ def case_protocol(rig):
     check(fds_open() == n, "no descriptor leaked: %d then %d" % (n, fds_open()))
 
 
-CASES = [case_settings, case_fail_open, case_borrow, case_pool, case_tensor, case_protocol]
+CASES = [case_settings, case_unit, case_fail_open, case_borrow, case_pool, case_tensor, case_protocol]
 
 
 def main():

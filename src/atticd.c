@@ -22,6 +22,7 @@
  * for dashboards. It carries no key and no address; the keyed socket stays the only way to borrow.
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -62,6 +63,9 @@ static struct config {
     const char *candidate; /* an artifact directory to run without VALIDATED: attic-check only */
     const char *mode;      /* "heap" or "list" */
     const char *version_file, *iomem, *meminfo;
+    const char *drm_dir;   /* where the DRM connectors' status files live (tests point it at a fake tree) */
+    const char *modeset_dir; /* where the /dev/nvidia-modeset holders' proc dirs live (default /proc; tests) */
+    const char *pmon_file;   /* nvidia-smi pmon -c 1 output (default: run nvidia-smi; tests point it at a file) */
     char state[PATH_MAX];  /* the ledger file (mode list) */
     char status_file[PATH_MAX];
     int no_status, status_every;
@@ -71,14 +75,17 @@ static struct config {
     const char *socket_group;
     int max_clients, max_slices, retry_s;
     int probe; /* bring up, print status, exit */
+    int probe_display; /* read-only: print each display signal's verdict, exit */
 } cfg = {
     .socket = ATTIC_DEFAULT_SOCKET,
-    .key = ATTIC_DEFAULT_KEY,
     .artifacts = ATTIC_DEFAULT_ARTIFACTS,
     .mode = "heap",
     .version_file = ATTIC_DEFAULT_VERSION_FILE,
     .iomem = "/proc/iomem",
     .meminfo = "/proc/meminfo",
+    .drm_dir = "/sys/class/drm",
+    .modeset_dir = "/proc",
+    .pmon_file = NULL,
     .minor = -1,
     .socket_mode = 0660,
     .max_clients = 64,
@@ -110,6 +117,9 @@ static struct {
     int up;        /* shim loaded, RM client open */
     int ready;     /* lending */
     int validated; /* the running driver's artifact is VALIDATED for this mode (not a candidate) */
+    int display_block; /* the ready flag is down because a display is in use (st.dwhy says so) */
+    char dwhy[384];    /* the display refusal text of the held block (st.why can name a newer reason) */
+    int display_idle;  /* complete idle readings in a row while the block is held (B3-R-OSCILLATION) */
     char why[512];
     void *dl;
     const struct attic_shim *shim;
@@ -133,12 +143,241 @@ static struct {
     /* clients */
     struct client **clients;
     int nclients;
+    int rm_strikes;   /* consecutive RM failures a client saw (N5: a broken RM client is reopened) */
     time_t next_retry;
 } st;
 
 static int heap_mode(void)
 {
     return strcmp(cfg.mode, "heap") == 0;
+}
+
+/* Signal (a): a process other than nvidia-persistenced holds /dev/nvidia-modeset. A holder is a proc
+ * dir with an fd whose symlink names the device and whose cmdline starts with something other than
+ * nvidia-persistenced: persistenced keeping the device open is the idle state; Xorg, gnome-shell or the
+ * modeset console holding it is a display client (the node readings: headless has persistenced only,
+ * a desktop adds Xorg, gnome-shell, mutter-x11-frames). A dir we cannot read (a pid that exited
+ * mid-scan) is not evidence either way. Tests point --modeset-dir at a fake tree of <pid>/fd/<n>
+ * symlinks and <pid>/cmdline files; on the node it is /proc and works as-is. */
+static DIR *modeset_scan; /* the scan's place in /proc: 256 entries a tick, the stream stays open */
+
+/* What the scan says: the verdict of the last COMPLETE pass (modeset_last, -1 before one has finished),
+ * refreshed the tick a pass finishes. A pass that ran out of its 256-look budget holds that verdict
+ * rather than re-deriving from the half it reached: the holder sits in the part a mid-pass tick has not
+ * looked at (B3-R-OSCILLATION: on a real GB10 the pass spans two ticks, so per-tick re-derivation made
+ * the verdict alternate and borrows through on the idle-reading ticks). */
+static int modeset_verdict;
+static int modeset_last = -1;
+static char modeset_who[128]; /* the holder's name, for the ticks that hold the last complete verdict */
+
+/* complete: read the directory to its end instead of stopping at the tick's 256 looks. The one-shot readers
+ * (--probe-display, bring-up and SIGHUP) pass 1: a holder past the budget's edge must not read as "no reading",
+ * which is not evidence and would let bring-up go ready over a desktop that is up. The tick passes 0. */
+static int modeset_holder(char *who, size_t n, int complete)
+{
+    if (modeset_scan == NULL) {
+        modeset_scan = opendir(cfg.modeset_dir);
+        if (modeset_scan == NULL) {
+            modeset_verdict = modeset_last; /* no /proc: the last verdict stands; none if never opened */
+            return 0;
+        }
+        rewinddir(modeset_scan);
+    }
+    struct dirent *e;
+    int found = 0;
+    int looked = 0;
+    while (!found && (complete || looked < 256) && (e = readdir(modeset_scan)) != NULL) {
+        looked++;
+        if (e->d_name[0] < '0' || e->d_name[0] > '9')
+            continue; /* proc dirs are numbers */
+        char pdir[PATH_MAX];
+        if (snprintf(pdir, sizeof pdir, "%s/%s", cfg.modeset_dir, e->d_name) >= (int)sizeof pdir)
+            continue;
+        char fddir[PATH_MAX];
+        if (snprintf(fddir, sizeof fddir, "%s/fd", pdir) >= (int)sizeof fddir)
+            continue;
+        DIR *fd = opendir(fddir);
+        if (fd == NULL)
+            continue; /* no fd dir (a kernel thread): not a holder */
+        int holds = 0;
+        struct dirent *f;
+        while (!holds && (f = readdir(fd)) != NULL) {
+            char link[PATH_MAX], target[PATH_MAX];
+            if (snprintf(link, sizeof link, "%s/%s", fddir, f->d_name) >= (int)sizeof link)
+                continue;
+            ssize_t r = readlink(link, target, sizeof target - 1);
+            if (r <= 0)
+                continue;
+            target[r] = 0;
+            if (strstr(target, "nvidia-modeset") != NULL)
+                holds = 1;
+        }
+        closedir(fd);
+        if (!holds)
+            continue;
+        char cmd[512];
+        size_t len;
+        char cmdpath[PATH_MAX];
+        if (snprintf(cmdpath, sizeof cmdpath, "%s/cmdline", pdir) >= (int)sizeof cmdpath)
+            continue;
+        if (attic_read_file(cmdpath, cmd, sizeof cmd, &len) != 0 || len == 0)
+            continue; /* a holder we cannot name: skip (a pid that exited between the two reads) */
+        for (size_t i = 0; i + 1 < len; i++)
+            if (cmd[i] == 0)
+                cmd[i] = ' '; /* argv is NUL-separated; flatten it for the name */
+        cmd[len] = 0;
+        /* argv[0] names the program: nvidia-persistenced keeping the driver loaded is the idle state. */
+        char prog[512];
+        size_t argv0 = strcspn(cmd, " "); /* the flatten made argv[0] the run up to the first space */
+        snprintf(prog, sizeof prog, "%.*s", (int)(argv0 < sizeof prog ? argv0 : sizeof prog - 1), cmd);
+        char *slash = strrchr(prog, '/');
+        char *base = slash ? slash + 1 : prog;
+        if (strcmp(base, "nvidia-persistenced") == 0)
+            continue;
+        snprintf(who, n, "pid %.24s (%.200s)", e->d_name, prog);
+        snprintf(modeset_who, sizeof modeset_who, "%s", who);
+        found = 1;
+    }
+    if (found) {
+        modeset_verdict = modeset_last = 1;
+        closedir(modeset_scan); /* a holder: the next tick starts a fresh pass */
+        modeset_scan = NULL;
+    } else if (e == NULL) {
+        modeset_verdict = modeset_last = 0;
+        rewinddir(modeset_scan); /* the pass is done: the next tick starts over */
+    } else {
+        modeset_verdict = modeset_last; /* the budget ran out with dirs left: the last complete pass stands */
+    }
+    return found;
+}
+
+/* Signal (b): a graphics (type G) process on the GPU - nvidia-smi pmon's own word for scanout work.
+ * The real probe runs nvidia-smi --query-accounted-apps? no: pmon -c 1 -s u. Tests point --pmon-file
+ * at a canned output; on the node we run nvidia-smi and read its output. A pmon we cannot run or read
+ * is not evidence: the other signals decide. */
+static time_t pmon_at; /* the last pmon run: nvidia-smi costs a second, the tick cannot spend it */
+
+/* What pmon says: the verdict of the last FRESH sample (pmon_last, -1 before one has been read), held
+ * across the ticks between the 30 s runs - a cached no is the sample's verdict, not a new reading
+ * (B3-R-OSCILLATION). A run that fails to read holds the last sample's verdict too; -1 only before the
+ * first sample ever read. */
+static int pmon_verdict;
+static int pmon_last = -1;
+static char pmon_who[64]; /* the type-G process' name, for the ticks that hold the last sample */
+
+static int graphics_process(char *who, size_t n)
+{
+    if (cfg.pmon_file == NULL && pmon_at && time(NULL) - pmon_at < 30) {
+        pmon_verdict = pmon_last; /* the cached reading: the sample stands until the next one */
+        if (pmon_verdict > 0)
+            snprintf(who, n, "%s", pmon_who);
+        return pmon_verdict > 0;
+    }
+    char buf[4096];
+    size_t len = 0;
+    if (cfg.pmon_file) {
+        if (attic_read_file(cfg.pmon_file, buf, sizeof buf - 1, &len) != 0) {
+            pmon_verdict = pmon_last;
+            return pmon_verdict > 0;
+        }
+        buf[len] = 0;
+    } else {
+        FILE *p = popen("nvidia-smi pmon -c 1 -s u 2>/dev/null", "r");
+        if (p == NULL) {
+            pmon_verdict = pmon_last;
+            return pmon_verdict > 0;
+        }
+        len = fread(buf, 1, sizeof buf - 1, p);
+        buf[len] = 0;
+        pclose(p);
+        pmon_at = time(NULL);
+    }
+    char *line = buf;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl)
+            *nl = 0;
+        /* pmon's lines: "gpu pid type sm mem enc dec jpg ofa"; type G is graphics/scanout. */
+        char *g = strstr(line, " G ");
+        char pid[32] = "";
+        if (g) {
+            /* the fields before G: gpu, then pid; the pid is the space-delimited field before the type */
+            char *p = g;
+            while (p > line && p[-1] == ' ')
+                p--;
+            char *field_end = p;
+            while (p > line && p[-1] != ' ')
+                p--;
+            if (p < field_end && p[0] >= '0' && p[0] <= '9')
+                snprintf(pid, sizeof pid, "%.*s", (int)(field_end - p), p);
+        }
+        if (pid[0]) {
+            snprintf(who, n, "pid %s runs graphics (type G)", pid);
+            snprintf(pmon_who, sizeof pmon_who, "pid %s runs graphics (type G)", pid);
+            pmon_verdict = pmon_last = 1;
+            return 1;
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    pmon_verdict = pmon_last = 0; /* a fresh sample read this tick: no graphics process in it */
+    return 0;
+}
+
+/* A display in use, by any of the three signals (STEER 11's node readings): (a) a process other than
+ * nvidia-persistenced holds /dev/nvidia-modeset, (b) the GPU lists a graphics (type G) process, (c) a
+ * DRM connector reports "connected" (the KMS systems; on stock DGX OS with nvidia-drm modeset=0 there
+ * are no connector dirs at all, so (a) and (b) carry the verdict there). atticd lends RM's free display
+ * heap, so a display that may light up and lending do not mix: bring-up refuses, and a display coming
+ * into use while lending stops new lends at once. No signal firing (a headless box, an idle desktop
+ * that only persistenced keeps loaded) lends. An unreadable probe is not evidence, never a block.
+ *
+ * The return says what to do about this tick's evidence, and the verdict that gates lending is held
+ * across ticks in display_watch: signals (a) and (b) are read on their own cadence (the modeset pass
+ * spans ticks, pmon runs every 30 s), and re-deriving per tick from one instant made the refusal
+ * oscillate on a real GB10 desktop (B3-R-OSCILLATION). 1 in use (a signal fired now, or its last
+ * complete reading found one and has not been replaced), 0 the readable signals read idle, -1 nothing
+ * readable at all (no evidence either way; it never blocks). complete: run the modeset scan to the end of the
+ * directory (the one-shot callers: --probe-display, bring-up and SIGHUP); the tick keeps its budget. */
+static int display_in_use(char *name, size_t n, int complete)
+{
+    int any_reading = 0; /* at least one signal produced a reading this tick */
+    if (modeset_holder(name, n, complete))
+        return 1;
+    if (modeset_verdict > 0) { /* the last complete pass found a holder and this pass has not overtaken it */
+        snprintf(name, n, "%s", modeset_who);
+        return 1;
+    }
+    if (modeset_verdict == 0)
+        any_reading = 1;
+    if (graphics_process(name, n))
+        return 1; /* a type G now, or the last fresh sample's, name filled either way */
+    if (pmon_verdict == 0)
+        any_reading = 1;
+    DIR *d = opendir(cfg.drm_dir);
+    if (d == NULL)
+        return any_reading ? 0 : -1; /* no DRM: nothing can light up, and that is a reading */
+    struct dirent *e;
+    int found = 0;
+    while (!found && (e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "card", 4) != 0 || strchr(e->d_name, '-') == NULL)
+            continue; /* connectors are card<N>-<CONNECTOR>; the card itself has no status */
+        char path[PATH_MAX], status[64];
+        size_t len;
+        if (snprintf(path, sizeof path, "%s/%s/status", cfg.drm_dir, e->d_name) >= (int)sizeof path)
+            continue;
+        if (attic_read_file(path, status, sizeof status, &len) != 0)
+            continue;
+        while (len && (status[len - 1] == '\n' || status[len - 1] == '\r' || status[len - 1] == ' '))
+            status[--len] = 0;
+        if (strcmp(status, "connected") == 0) {
+            snprintf(name, n, "%s", e->d_name);
+            found = 1;
+        }
+    }
+    closedir(d);
+    if (found)
+        return 1;
+    return 0; /* the connector scan always reads (a missing dir is a reading too) */
 }
 
 static void say(char *why, size_t n, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
@@ -170,6 +409,56 @@ static void let_go(uint32_t h)
     char e[256];
     if (st.shim->release(st.rm, h, e, sizeof e) != 0)
         LOGW("releasing RM handle %#x: %s", h, e);
+}
+
+static uint64_t heap_draining(void);
+static void tear_down(void);
+static uint64_t rm_out(void);
+static void rm_reopen(void);
+
+/* How much memory clients still hold (drains included): reopening the RM client while this is not zero would
+ * orphan it. */
+static uint64_t rm_out(void)
+{
+    if (heap_mode())
+        return st.lent + heap_draining();
+    if (!st.ledger.count)
+        return 0;
+    return (uint64_t)(ledger_count(&st.ledger, SLICE_LENT) + ledger_count(&st.ledger, SLICE_DRAINING)) * ATTIC_SLICE;
+}
+
+/* An RM call a client saw fail (N5): three in a row mean the RM client is broken, not the request. With nothing
+ * lent, the client is torn down and reopened (the next tick brings a fresh one up); with slices out, reopening
+ * would orphan the memory they hold, so atticd keeps serving refusals until the last client drops, and the tick
+ * reopens then. A success clears the strikes. */
+static void rm_strike(void)
+{
+    st.rm_strikes++;
+    if (st.rm_strikes < 3)
+        return;
+    uint64_t out = rm_out();
+    if (out) {
+        LOGW("the RM client failed %d requests in a row; %llu MiB is still out with clients, so it stays open "
+             "until they drop", st.rm_strikes, MiB(out));
+        return;
+    }
+    rm_reopen();
+}
+
+/* The strikes said rebuild but slices were still out; once the last one drains, the tick reopens the client. */
+static void rm_idle_check(void)
+{
+    if (st.up && st.rm_strikes >= 3 && rm_out() == 0)
+        rm_reopen();
+}
+
+static void rm_reopen(void)
+{
+    snprintf(st.why, sizeof st.why, "the RM client failed %d requests in a row: closing and reopening it",
+             st.rm_strikes);
+    LOGE("%s", st.why);
+    tear_down();
+    st.next_retry = time(NULL); /* the next tick brings a fresh client up */
 }
 
 /* The largest block the heap gives now, at most `most` bytes, found by halving (a try is an alloc and a free). */
@@ -225,9 +514,26 @@ static void let_go_all(struct taken *t)
 
 /* ---- bring-up ---- */
 
+static int heap_probe_once(char *why, size_t n, uint64_t r); /* below */
+
 static int heap_bring_up(char *why, size_t n)
 {
     uint64_t r = st.display;
+    /* A reclaim burst (a parallel build, kswapd) reads exactly like a heap that came from System RAM:
+     * MemFree dips hard for a moment. One retry separates them - a burst passes the second time, a
+     * dishonest heap loses its bytes every time. */
+    if (heap_probe_once(why, n, r) != 0) {
+        struct timespec ts = {.tv_sec = 2, .tv_nsec = 0}; /* a burst longer than 200 ms is common */
+        nanosleep(&ts, NULL);
+        if (heap_probe_once(why, n, r) != 0)
+            return -1;
+        LOGW("the display-heap probe passed on the second look (the first read a reclaim burst)");
+    }
+    return 0;
+}
+
+static int heap_probe_once(char *why, size_t n, uint64_t r)
+{
     uint32_t h;
     double t0 = now_s();
     if (hold(r + ATTIC_SLICE, &h) == 0) {
@@ -236,7 +542,14 @@ static int heap_bring_up(char *why, size_t n)
             MiB(r));
         return -1;
     }
-    uint64_t m0 = attic_mem_free(cfg.meminfo);
+    uint64_t m0 = 0;
+    for (int i = 0; i < 10; i++) { /* the highest pre-hold reading: reclaim dips, the peak is the truth */
+        uint64_t m = attic_mem_free(cfg.meminfo);
+        if (m > m0)
+            m0 = m;
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
     struct taken t;
     take_all(r, &t);
     if (t.total == 0) {
@@ -246,7 +559,14 @@ static int heap_bring_up(char *why, size_t n)
     int more = hold(ATTIC_SLICE, &h) == 0;
     if (more)
         let_go(h);
-    uint64_t m1 = attic_mem_free(cfg.meminfo);
+    uint64_t m1 = 0;
+    for (int i = 0; i < 10; i++) { /* the least-churned reading while held: reclaim noise only lowers it */
+        uint64_t m = attic_mem_free(cfg.meminfo);
+        if (m > m1)
+            m1 = m;
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
     let_go_all(&t);
     if (more) {
         say(why, n, "with all %llu MiB of the display heap held RM still gave a slice: it may come from System RAM",
@@ -257,7 +577,7 @@ static int heap_bring_up(char *why, size_t n)
         say(why, n, "cannot read MemFree from %s", cfg.meminfo);
         return -1;
     }
-    if (m0 > m1 && m0 - m1 > t.total / 4) {
+    if (m0 > m1 && m0 - m1 > t.total * 3 / 4) {
         say(why, n, "holding %llu MiB of the display heap took %llu MiB of MemFree: it is not the carveout",
             MiB(t.total), MiB(m0 - m1));
         return -1;
@@ -349,7 +669,22 @@ static void bring_up(void)
 {
     char why[512] = "";
     st.next_retry = time(NULL) + cfg.retry_s;
+    if (st.display_block) {
+        /* The held display verdict stands (B3-R-OSCILLATION): a retry does not re-derive it from one
+         * instant, because a scan pass that ran out of its 256-look budget or a throttled pmon can read
+         * idle while the desktop is still up. Only display_watch's streak of complete idle readings
+         * lifts the block. Nothing below runs, so the artifact state the last bring-up found stands. */
+        say(why, sizeof why, "%s", st.dwhy[0] ? st.dwhy : "a display is in use");
+        goto refuse;
+    }
     st.validated = 0;
+    /* Mode list is not released (S4): no node ever passed it (580.178.04 refuses memory lists), and its safety
+     * rests on the ledger's pid check alone. The candidate path keeps it, so a node can still validate it. */
+    if (!heap_mode() && !cfg.candidate) {
+        say(why, sizeof why, "mode list is not released in " ATTICD_VERSION ": it has never passed on a node "
+            "(580.178.04 refuses memory lists); run it only as a candidate, for the node check");
+        goto refuse;
+    }
     if (attic_driver_version(cfg.version_file, st.driver, sizeof st.driver) != 0) {
         snprintf(st.driver, sizeof st.driver, "none");
         say(why, sizeof why, "no NVIDIA driver loaded (%s unreadable)", cfg.version_file);
@@ -402,9 +737,19 @@ static void bring_up(void)
         say(why, sizeof why, "RM reports no display carveout on this GPU");
         goto refuse;
     }
+    char conn[256];
+    if (display_in_use(conn, sizeof conn, 1) > 0) {
+        st.display_block = 1;
+        say(why, sizeof why, "a display is in use (%s): atticd lends the memory a display needs", conn);
+        snprintf(st.dwhy, sizeof st.dwhy, "%s", why);
+        goto refuse;
+    }
     if ((heap_mode() ? heap_bring_up(why, sizeof why) : list_bring_up(why, sizeof why)) != 0)
         goto refuse;
     st.ready = 1;
+    st.display_block = 0;
+    st.display_idle = 0;
+    st.dwhy[0] = 0;
     st.why[0] = 0;
     LOGI("lending: driver %s, mode %s, shim %s (sha256 %.12s, %s %s)", st.driver, cfg.mode, st.art.shim,
          st.art.sha256, cfg.candidate ? "candidate" : "validated", cfg.candidate ? "" : st.art.checked);
@@ -435,10 +780,72 @@ static void recheck(void)
         snprintf(st.why, sizeof st.why, "%s", why);
         LOGE("lending stopped: %s (slices already lent stay with their clients)", why);
     } else if (!st.ready) {
-        st.ready = 1;
-        st.why[0] = 0;
-        LOGI("lending again");
+        char conn[256];
+        if (st.display_block) {
+            /* The held display verdict stands (B3-R-OSCILLATION): SIGHUP does not re-derive it from one
+             * instant; display_watch's idle streak lifts it. */
+            snprintf(st.why, sizeof st.why, "%s", st.dwhy[0] ? st.dwhy : "a display is in use");
+        } else if (display_in_use(conn, sizeof conn, 1) > 0) {
+            st.display_block = 1;
+            snprintf(st.dwhy, sizeof st.dwhy,
+                     "a display is in use (%s): atticd lends the memory a display needs", conn);
+            snprintf(st.why, sizeof st.why, "%s", st.dwhy);
+            LOGE("lending stopped: %s (slices already lent stay with their clients)", st.why);
+        } else {
+            st.ready = 1;
+            st.display_block = 0;
+            st.dwhy[0] = 0;
+            st.why[0] = 0;
+            LOGI("lending again");
+        }
     }
+}
+
+/* The display check, every tick. One call to display_in_use reads one instant, and on a real desktop
+ * the samples are sparser than this 2 s tick: the modeset pass covers at most 256 proc entries (the
+ * holder is found only on the ticks whose pass reaches it) and pmon runs every 30 s, so re-deriving
+ * the verdict per tick let borrows through on the idle-reading ticks while the desktop was up all
+ * along (B3-R-OSCILLATION: 12 of 20 borrows succeeded on a real GB10). The verdict is therefore held:
+ * a display seen in use keeps new lends refused continuously - the idle-reading ticks change nothing -
+ * and the block lifts only after DISPLAY_HOLD_TICKS ticks in a row whose readable signals all read
+ * idle. One stopped line when the block engages, one again line when it lifts; the ticks between log
+ * nothing. */
+#define DISPLAY_HOLD_TICKS 3
+
+static void display_watch(void)
+{
+    char conn[256];
+    int in_use = display_in_use(conn, sizeof conn, 0);
+    if (in_use > 0) {
+        st.display_idle = 0;
+        if (st.ready) {
+            st.ready = 0;
+            st.display_block = 1;
+            snprintf(st.dwhy, sizeof st.dwhy,
+                     "a display is in use (%s): atticd lends the memory a display needs", conn);
+            snprintf(st.why, sizeof st.why, "%s", st.dwhy);
+            LOGE("lending stopped: %s (slices already lent stay with their clients)", st.why);
+        }
+        /* already held, or refusing for another reason: the verdict stands, nothing is logged again */
+    } else if (st.display_block && in_use == 0) {
+        if (++st.display_idle >= DISPLAY_HOLD_TICKS) {
+            st.display_block = 0;
+            st.display_idle = 0;
+            if (!st.up) {
+                bring_up(); /* the block is off: an immediate bring-up try, nobody waits out --retry */
+            } else if (st.why[0] == 0 || strcmp(st.why, st.dwhy) == 0) {
+                /* the display was the reason lending stopped: resume */
+                st.ready = 1;
+                st.dwhy[0] = 0;
+                st.why[0] = 0;
+                LOGI("lending again: the display is gone");
+            }
+            /* else another refusal stands (an artifact gone or changed): the display block is lifted,
+             * that refusal keeps lending stopped */
+        }
+    }
+    /* in_use < 0: nothing readable at all this tick - a held block stands and an idle streak neither
+     * grows nor resets. */
 }
 
 /* ---- accounting ---- */
@@ -659,6 +1066,12 @@ static int op_alloc(struct client *c, const struct attic_req *r)
     if (c->nlends >= cfg.max_slices)
         return refuse(c, "this client holds as many slices as one client may");
     reap();
+    /* The display verdict is held by the tick (display_watch): a desktop that starts between ticks
+     * stops new lends within one tick, and while it is up the block does not oscillate with the
+     * samples (B3-R-OSCILLATION). No scan here - the modeset holder probe walks every proc fd dir,
+     * and an alloc must answer in well under the client's timeout. */
+    if (st.display_block)
+        return refuse(c, st.dwhy[0] ? st.dwhy : "a display is in use: atticd lends the memory a display needs");
     uint64_t total, freeb, largest, lent, draining;
     sizes(&total, &freeb, &largest, &lent, &draining);
     uint32_t h;
@@ -671,6 +1084,7 @@ static int op_alloc(struct client *c, const struct attic_req *r)
         if (st.shim->heap(st.rm, size, &h, e, sizeof e) != 0) {
             st.stale = 1;
             say(w, sizeof w, "RM's display heap: %s", e);
+            rm_strike();
             return refuse(c, w);
         }
     } else {
@@ -682,6 +1096,7 @@ static int op_alloc(struct client *c, const struct attic_req *r)
         }
         if (st.shim->list(st.rm, st.ledger.base + (uint64_t)first * ATTIC_SLICE, size, &h, e, sizeof e) != 0) {
             say(w, sizeof w, "RM memory list: %s", e);
+            rm_strike();
             return refuse(c, w);
         }
     }
@@ -689,6 +1104,7 @@ static int op_alloc(struct client *c, const struct attic_req *r)
     if (st.shim->export_fd(st.rm, h, &fd, e, sizeof e) != 0) {
         let_go(h);
         say(w, sizeof w, "RM export: %s", e);
+        rm_strike();
         return refuse(c, w);
     }
     struct lend *more = realloc(c->lends, (size_t)(c->nlends + 1) * sizeof *more);
@@ -699,6 +1115,7 @@ static int op_alloc(struct client *c, const struct attic_req *r)
     }
     c->lends = more;
     c->lends[c->nlends++] = (struct lend){h, size, first};
+    st.rm_strikes = 0;
     if (heap_mode()) {
         st.lent += size;
         st.stale = 1;
@@ -914,7 +1331,7 @@ static void usage(FILE *f)
     fprintf(f,
             "usage: atticd [options]\n"
             "  --socket PATH        listen here (default " ATTIC_DEFAULT_SOCKET ")\n"
-            "  --key KEY | --key-file PATH   the key clients send (default " ATTIC_DEFAULT_KEY ")\n"
+            "  --key KEY | --key-file PATH   the key clients send (required; no default)\n"
             "  --artifacts DIR      per-driver artifacts (default " ATTIC_DEFAULT_ARTIFACTS ")\n"
             "  --candidate DIR      run this artifact unvalidated (attic-check only; not on the default socket)\n"
             "  --mode heap|list     how slices are made (default heap)\n"
@@ -927,6 +1344,10 @@ static void usage(FILE *f)
             "                       \"status.json\"; none for a candidate)\n"
             "  --no-status-file     --status-every SECONDS (10; at least 2, atticd's clock)\n"
             "  --version-file PATH  --iomem PATH  --meminfo PATH   (tests)\n"
+            "  --drm-dir PATH       where the DRM connectors' status files live (default /sys/class/drm; tests)\n"
+            "  --modeset-dir PATH   where the modeset holders' proc dirs live (default /proc; tests)\n"
+            "  --pmon-file PATH     canned nvidia-smi pmon output instead of running nvidia-smi (tests)\n"
+            "  --probe-display      read-only: one line per display signal, then exit (0 none, 1 in use)\n"
             "  --probe              bring up, print the status JSON, exit (0 ready, 3 refusing)\n");
 }
 
@@ -955,7 +1376,9 @@ static int parse_args(int argc, char **argv)
         {"max-clients", required_argument, 0, 'C'},  {"max-slices", required_argument, 0, 'S'},
         {"retry", required_argument, 0, 'r'},        {"state", required_argument, 0, 'L'},
         {"version-file", required_argument, 0, 'v'}, {"iomem", required_argument, 0, 'i'},
-        {"meminfo", required_argument, 0, 'M'},      {"probe", no_argument, 0, 'P'},
+        {"meminfo", required_argument, 0, 'M'},      {"drm-dir", required_argument, 0, 'R'},
+        {"modeset-dir", required_argument, 0, 'D'},  {"pmon-file", required_argument, 0, 'U'},
+        {"probe", no_argument, 0, 'P'},              {"probe-display", no_argument, 0, 'Q'},
         {"status-file", required_argument, 0, 'F'},  {"no-status-file", no_argument, 0, 'N'},
         {"status-every", required_argument, 0, 'E'}, {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
@@ -980,7 +1403,15 @@ static int parse_args(int argc, char **argv)
         case 'c': cfg.candidate = optarg; break;
         case 'm': cfg.mode = optarg; break;
         case 'g': cfg.minor = (int)strtol(optarg, &end, 10); break;
-        case 'p': cfg.keep = strtoull(optarg, &end, 10) << 20; break;
+        case 'p': {
+            uint64_t mib = strtoull(optarg, &end, 10);
+            if (end == optarg || mib % 2) {
+                LOGE("--keep-mib %s: not a whole number of 2 MiB slices (atticd lends whole 2 MiB slices)", optarg);
+                return -1;
+            }
+            cfg.keep = mib << 20;
+            break;
+        }
         case 'o': cfg.socket_mode = (mode_t)strtoul(optarg, &end, 8); break;
         case 'G': cfg.socket_group = optarg; break;
         case 'C': cfg.max_clients = (int)strtol(optarg, &end, 10); break;
@@ -993,7 +1424,11 @@ static int parse_args(int argc, char **argv)
         case 'v': cfg.version_file = optarg; break;
         case 'i': cfg.iomem = optarg; break;
         case 'M': cfg.meminfo = optarg; break;
+        case 'R': cfg.drm_dir = optarg; break;
+        case 'D': cfg.modeset_dir = optarg; break;
+        case 'U': cfg.pmon_file = optarg; break;
         case 'P': cfg.probe = 1; break;
+        case 'Q': cfg.probe_display = 1; break;
         case 'h': usage(stdout); exit(0);
         default: return -1;
         }
@@ -1004,7 +1439,12 @@ static int parse_args(int argc, char **argv)
     }
     if (optind != argc || (strcmp(cfg.mode, "heap") != 0 && strcmp(cfg.mode, "list") != 0))
         return -1;
-    if (!attic_key_ok(cfg.key)) {
+    if (cfg.key[0] == 0 && !cfg.probe_display) {
+        LOGE("no key: give --key or --key-file (as root: umask 077; od -An -N12 -tx1 /dev/urandom | tr -d ' \\n' | "
+             "sed s/^/attic_/ > /etc/spark-attic/key)");
+        return -1;
+    }
+    if (!cfg.probe_display && !attic_key_ok(cfg.key)) {
         LOGE("a key is 1 to %d printable characters without quotes or backslashes", ATTIC_KEY_MAX);
         return -1;
     }
@@ -1024,6 +1464,48 @@ static int parse_args(int argc, char **argv)
     else if (cfg.status_file[0] == 0 && !cfg.candidate) /* attic-validate.sh runs a candidate beside the real socket */
         snprintf(cfg.status_file, sizeof cfg.status_file, "%.*s%sstatus.json", dirlen, cfg.socket, slash ? "/" : "");
     return 0;
+}
+
+/* --probe-display: read-only. One line per signal: the modeset holders, pmon's graphics processes, the
+ * DRM connectors. No key, no artifacts, no socket, nothing written. Exit 0 when nothing is in use,
+ * 1 when a signal fires; the node's operator and the tests read the lines, not just the code. */
+static int probe_display_run(void)
+{
+    char who[256];
+    int a = modeset_holder(who, sizeof who, 1);
+    printf("%s modeset-holder: %s\n", a ? "IN-USE" : "idle", a ? who : "only nvidia-persistenced, or nothing readable");
+    int b = graphics_process(who, sizeof who);
+    printf("%s graphics-process: %s\n", b ? "IN-USE" : "idle", b ? who : "no type G process (or pmon unreadable)");
+    int c = 0;
+    DIR *d = opendir(cfg.drm_dir);
+    if (d) {
+        struct dirent *e;
+        while (!c && (e = readdir(d)) != NULL) {
+            if (strncmp(e->d_name, "card", 4) != 0 || strchr(e->d_name, '-') == NULL)
+                continue;
+            char path[PATH_MAX], status[64];
+            size_t len;
+            if (snprintf(path, sizeof path, "%s/%s/status", cfg.drm_dir, e->d_name) >= (int)sizeof path)
+                continue;
+            if (attic_read_file(path, status, sizeof status, &len) == 0) {
+                while (len && (status[len - 1] == '\n' || status[len - 1] == '\r'))
+                    status[--len] = 0;
+                if (strcmp(status, "connected") == 0) {
+                    printf("IN-USE drm-connector: %s reports connected\n", e->d_name);
+                    c = 1;
+                }
+            }
+        }
+        closedir(d);
+        if (!c)
+            printf("idle drm-connector: no connector reports connected (none readable counts the same)\n");
+    } else {
+        printf("idle drm-connector: no DRM directory at %s\n", cfg.drm_dir);
+    }
+    int any = a || b || c;
+    printf("%s: a display %s\n", any ? "IN-USE" : "idle", any ? "is in use; atticd would lend nothing"
+           : "is not in use by any signal atticd reads");
+    return any ? 1 : 0;
 }
 
 static int probe_only(void)
@@ -1048,6 +1530,9 @@ int main(int argc, char **argv)
         usage(stderr);
         return 2;
     }
+
+    if (cfg.probe_display)
+        return probe_display_run();
     if (cfg.probe)
         return probe_only();
 
@@ -1102,6 +1587,8 @@ int main(int argc, char **argv)
                 while (read(tfd, &ticks, sizeof ticks) == sizeof ticks)
                     ;
                 reap();
+                display_watch();
+                rm_idle_check();
                 if (!st.up && time(NULL) >= st.next_retry)
                     bring_up();
                 heap_settle(0);

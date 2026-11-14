@@ -10,9 +10,13 @@
 #   ATTIC_BIN (atticd, attic-check; default ../bin beside this script), ATTIC_LIB (/var/lib/attic), ATTIC_RUN
 #   (/run/spark-attic), ATTIC_VERSION_FILE, ATTIC_OTHER_SOCKETS (other lenders' sockets that must be stopped; none by default),
 #   ATTIC_CHECK_ARGS / ATTIC_DAEMON_ARGS (extra attic-check / candidate atticd flags), ATTIC_HUP (how to tell atticd),
-#   ATTIC_KEY or ATTIC_KEY_FILE (the running atticd's key, to read its status; default the unit's /etc/spark-attic/key,
-#   else spark-attic-1), ATTIC_TEST=1 (host tests: no root).
+#   ATTIC_KEY or ATTIC_KEY_FILE (the running atticd's key, to read its status; default the unit's /etc/spark-attic/key;
+#   there is no other default: atticd runs with no compiled-in key), ATTIC_TEST=1 (host tests: no root).
 set -uo pipefail
+# Everything this script writes is root-only by default (umask 077): the check reports carry the regions'"'"' physical
+# addresses (attic-check embeds the keyed status reply), and the candidate ledger does too. The files that must be
+# readable get their mode back below (chmod 644 the shim, BUILD-INFO, VALIDATED).
+umask 077
 CAND=$(cd "${1:?usage: attic-validate.sh CANDIDATE_DIR [MODES]}" && pwd) || exit 2
 MODES=${2:-heap list}
 HERE=$(dirname "$(readlink -f "$0")")
@@ -23,6 +27,7 @@ VFILE=${ATTIC_VERSION_FILE:-/proc/driver/nvidia/version}
 OTHERS=${ATTIC_OTHER_SOCKETS:-}
 KEYF=${ATTIC_KEY_FILE:-/etc/spark-attic/key}
 KEY=attic-check-$(od -An -N8 -tx8 /dev/urandom | tr -d " ")
+CANDKEY=$RUN/candidate-key
 say() { echo "attic-validate: $*" >&2; }
 value() { sed -n "s/^$1=//p" "$2" | head -n1; }
 
@@ -42,7 +47,8 @@ listening() { ss -H -x -l 2>/dev/null | awk -v p="$1" '$5 == p { found = 1 } END
 if [ -S "$RUN/attic.sock" ] && listening "$RUN/attic.sock"; then
   K=${ATTIC_KEY:-}
   if [ -z "$K" ] && [ -r "$KEYF" ]; then K=$(head -n1 "$KEYF" | sed 's/[[:space:]]*$//'); fi
-  ST=$("$BIN/attic-check" --status --socket "$RUN/attic.sock" --key "${K:-spark-attic-1}" 2>/dev/null || true)
+  ST=""
+  [ -z "$K" ] || ST=$(ATTIC_CHECK_KEY="$K" "$BIN/attic-check" --status --socket "$RUN/attic.sock" 2>/dev/null || true)
   if [[ $ST != *'"ok":true'* ]]; then
     say "atticd answers on $RUN/attic.sock but gave no status with its key (ATTIC_KEY, or ATTIC_KEY_FILE: $KEYF)"
     say "stop it for the check (systemctl stop attic.service): ${ST:-no reply}"
@@ -66,7 +72,7 @@ done
 
 DEST=$LIB/candidates/$DRIVER
 mkdir -p "$LIB/candidates" "$LIB/artifacts" "$RUN"
-chmod 755 "$LIB" "$LIB/candidates" "$LIB/artifacts"
+chmod 755 "$LIB" "$LIB/candidates" "$LIB/artifacts" "$RUN"
 mkdir -p "$DEST"
 if [ "$CAND" != "$DEST" ]; then  # earlier FAILED-* reports stay
   rm -f "$DEST/rmshim.so" "$DEST/BUILD-INFO" "$DEST"/check-* "$DEST"/atticd-*
@@ -74,23 +80,27 @@ if [ "$CAND" != "$DEST" ]; then  # earlier FAILED-* reports stay
 fi
 chmod 755 "$DEST"
 chmod 644 "$DEST/rmshim.so" "$DEST/BUILD-INFO"
+chmod 600 "$DEST"/check-*.json 2>/dev/null # reports carry physical addresses (N3), even copied over old ones
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 PASSED=()
 for m in $MODES; do
   SOCK=$RUN/candidate.sock
   rm -f "$DEST/check-$m.json"
+  # the candidate key goes beside the socket, root-only (umask 077), not on a command line (M3)
+  printf '%s\n' "$KEY" > "$CANDKEY"
   # shellcheck disable=SC2086
-  "$BIN/atticd" --candidate "$DEST" --mode "$m" --socket "$SOCK" --key "$KEY" --state "$RUN/candidate-ledger" \
+  "$BIN/atticd" --candidate "$DEST" --mode "$m" --socket "$SOCK" --key-file "$CANDKEY" --state "$RUN/candidate-ledger" \
     --version-file "$VFILE" --retry 3600 ${ATTIC_DAEMON_ARGS:-} >"$DEST/atticd-$m.log" 2>&1 &
   PID=$!
   for _ in $(seq 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
   # shellcheck disable=SC2086
-  "$BIN/attic-check" --socket "$SOCK" --key "$KEY" --mode "$m" --report "$DEST/check-$m.json" ${ATTIC_CHECK_ARGS:-} \
+  "$BIN/attic-check" --socket "$SOCK" --key-file "$CANDKEY" --mode "$m" --report "$DEST/check-$m.json" \
+    ${ATTIC_CHECK_ARGS:-} \
     >"$DEST/check-$m.out" 2>&1
   RC=$?
   kill -TERM "$PID" 2>/dev/null
   wait "$PID" 2>/dev/null
-  rm -f "$RUN/candidate-ledger"
+  rm -f "$RUN/candidate-ledger" "$CANDKEY"
   if [ $RC = 0 ]; then
     PASSED+=("$m")
     say "mode $m: attic-check passed ($DEST/check-$m.json)"
@@ -102,6 +112,11 @@ for m in $MODES; do
 done
 [ ${#PASSED[@]} -gt 0 ] || { say "driver $DRIVER: no mode passed; nothing enabled"; exit 1; }
 
+# Earlier reports in the candidate dir (this driver's and earlier FAILED-* ones from reruns) may come
+# from a run before the 0600 rule: tighten them all before the install (N3).
+for f in "$DEST"/check-*.json "$DEST"/FAILED-*.json; do
+  [ -e "$f" ] && chmod 600 "$f"
+done
 MODELIST=$(IFS=,; echo "${PASSED[*]}")
 NEW=$LIB/artifacts/.$DRIVER.new
 rm -rf "$NEW"
@@ -115,14 +130,22 @@ driver=$DRIVER
 shim_sha256=$SHA
 modes=$MODELIST
 checked=$(date -u +%FT%TZ)
-host=$(hostname)
+host=${ATTIC_BUILT_ON:-$(hostname)}
 report=$(for m in "${PASSED[@]}"; do printf '%s ' "$LIB/artifacts/$DRIVER/check-$m.json"; done)
 attic_commit=$(value attic_commit "$DEST/BUILD-INFO")
 V
 chmod 755 "$NEW"
-chmod 644 "$NEW"/*
+for f in "$NEW"/*; do
+  case $(basename "$f") in
+    check-*.json) chmod 600 "$f" ;; # the reports carry the regions' physical addresses (N3): root-only
+    *) chmod 644 "$f" ;;
+  esac
+done
 rm -rf "$LIB/artifacts/.$DRIVER.old"
 [ -d "$LIB/artifacts/$DRIVER" ] && mv "$LIB/artifacts/$DRIVER" "$LIB/artifacts/.$DRIVER.old"
+# An install from before the 0600 rule leaves its reports world-readable in .old (N3): remove them -
+# the new install's reports are the ones that matter now.
+rm -f "$LIB/artifacts/.$DRIVER.old"/check-*.json
 mv "$NEW" "$LIB/artifacts/$DRIVER"
 say "driver $DRIVER VALIDATED for $MODELIST: $LIB/artifacts/$DRIVER"
 if [ -n "${ATTIC_HUP:-}" ]; then

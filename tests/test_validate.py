@@ -8,6 +8,7 @@ still in use.
     python3 -I tests/test_validate.py --bin build/host
 """
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +47,14 @@ class Node:
 
     def __init__(self, bindir):
         self.bin = bindir
+        self.attic_before = set()
+        for p in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                if "atticd" in open(p, "rb").read().decode(errors="replace") or \
+                   "attic-check" in open(p, "rb").read().decode(errors="replace"):
+                    self.attic_before.add(int(p.split("/")[2]))
+            except (OSError, ValueError):
+                continue
         self.dir = tempfile.mkdtemp(prefix="attic-validate-")
         os.chmod(self.dir, 0o755)
         self.lib = os.path.join(self.dir, "lib")
@@ -56,6 +66,9 @@ class Node:
                            ("iomem", "80000000-27fffffff : System RAM\n280000000-2ffffffff : reserved\n")):
             with open(os.path.join(self.dir, name), "w") as f:
                 f.write(text)
+        self.keyfile = os.path.join(self.dir, "prodkey")  # the prod daemon's key, as the unit keeps it
+        with open(self.keyfile, "w") as f:
+            f.write(KEY + "\n")
         self.cand = os.path.join(self.dir, "cand", "999.0.1")
         os.makedirs(self.cand)
         shutil.copyfile(os.path.join(bindir, "fakeshim.so"), os.path.join(self.cand, "rmshim.so"))
@@ -69,19 +82,21 @@ class Node:
                         ATTIC_DAEMON_ARGS="--meminfo %s/meminfo --iomem %s/iomem" % (self.dir, self.dir),
                         LD_LIBRARY_PATH=os.path.join(bindir, "fakecuda"),
                         ATTIC_FAKE_REGION="0x280000000:0x8000000", ATTIC_FAKE_HELD="0", ATTIC_HUP="true",
-                        ATTIC_KEY_FILE=os.path.join(self.dir, "no-key-file"))
+                        ATTIC_KEY_FILE=self.keyfile)
 
     def driver(self, v):
         with open(self.version, "w") as f:
             f.write("NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  %s  Release Build  (test)\n" % v)
 
     def start_prod(self, *key):
-        """The node's own atticd, before any VALIDATED: it refuses until told. `key`: its key flags (--key KEY)."""
+        """The node's own atticd, before any VALIDATED: it refuses until told. `key`: its key flags, default
+        the key file the unit keeps (no key on its command line either, M3)."""
         sock = os.path.join(self.run, "attic.sock")
         os.makedirs(os.path.join(self.lib, "artifacts"), exist_ok=True)
         os.chmod(self.lib, 0o755)
         os.chmod(os.path.join(self.lib, "artifacts"), 0o755)
-        self.prod = subprocess.Popen([os.path.join(self.bin, "atticd"), "--socket", sock, *(key or ("--key", KEY)),
+        self.prod = subprocess.Popen([os.path.join(self.bin, "atticd"), "--socket", sock,
+                                      *(key or ("--key-file", self.keyfile)),
                                       "--artifacts", os.path.join(self.lib, "artifacts"), "--version-file", self.version,
                                       "--meminfo", os.path.join(self.dir, "meminfo"), "--iomem",
                                       os.path.join(self.dir, "iomem")],
@@ -95,8 +110,34 @@ class Node:
 
     def validate(self, modes="heap list", **extra):
         env = dict(self.env, **extra)
-        p = subprocess.run([os.path.join(HERE, "scripts", "attic-validate.sh"), self.cand, modes], env=env,
-                           capture_output=True, text=True, timeout=600)
+        self.cmdline_leaks = []
+        stop = threading.Event()
+
+        def watch():  # M3: what the run puts on a command line is visible only while it runs
+            while not stop.is_set():
+                for p in glob.glob("/proc/[0-9]*/cmdline"):
+                    try:
+                        pid = int(p.split("/")[2])
+                        if pid in self.attic_before:
+                            continue
+                        cmd = open(p, "rb").read().decode(errors="replace").replace("\0", " ")
+                        if self.dir not in cmd:
+                            continue  # another run's (or a leftover run's) daemon: not this test's evidence
+                        if ("atticd" in cmd or "attic-check" in cmd) and \
+                           ("--key " in cmd or "spark-attic-1" in cmd):
+                            self.cmdline_leaks.append(cmd[:160])
+                    except (OSError, ValueError):
+                        continue
+                stop.wait(0.02)
+
+        w = threading.Thread(target=watch, daemon=True)
+        w.start()
+        try:
+            p = subprocess.run([os.path.join(HERE, "scripts", "attic-validate.sh"), self.cand, modes], env=env,
+                               capture_output=True, text=True, timeout=600)
+        finally:
+            stop.set()
+            w.join(2)
         return p.returncode, p.stderr
 
     def validated(self):
@@ -107,7 +148,8 @@ class Node:
         if self.prod and self.prod.poll() is None:
             self.prod.send_signal(signal.SIGTERM)
             self.prod.wait(10)
-        shutil.rmtree(self.dir, ignore_errors=True)
+        if os.environ.get("KEEP_NODE") != "1":
+            shutil.rmtree(self.dir, ignore_errors=True)
 
 
 def main():
@@ -126,6 +168,21 @@ def main():
         shim = os.path.join(n.lib, "artifacts", "999.0.1", "rmshim.so")
         sha = hashlib.sha256(open(shim, "rb").read()).hexdigest() if os.path.exists(shim) else "missing"
         check(("shim_sha256=%s" % sha) in v, "VALIDATED names the installed shim's digest")
+        # N3: the installed check reports carry the regions' physical addresses; the shim and BUILD-INFO must
+        # stay readable, the reports must not.
+        art = os.path.join(n.lib, "artifacts", "999.0.1")
+        for f in ("check-heap.json", "check-list.json"):
+            p = os.path.join(art, f)
+            check(os.path.exists(p) and oct(os.stat(p).st_mode & 0o777) == "0o600",
+                  "%s is 0600, not world-readable (N3)" % f)
+        for f in ("rmshim.so", "BUILD-INFO", "VALIDATED"):
+            p = os.path.join(art, f)
+            check(oct(os.stat(p).st_mode & 0o777) == "0o644", "%s stays 0644 (N3)" % f)
+        check(oct(os.stat(art).st_mode & 0o777) == "0o755", "the artifact directory stays 0755 (N3)")
+        # M3: nothing this node's run put a key on a command line - sampled live by validate(), because
+        # the candidate daemons live only while it runs.
+        check(not n.cmdline_leaks,
+              "no atticd or attic-check of this run holds a key in /proc (M3): %r" % n.cmdline_leaks[:2])
         time.sleep(0.5)
         r = info(sock)
         check(r["ok"] is True and r["size"] == 128 << 20, "told by SIGHUP, the node's atticd lends: %r" % r)
@@ -162,6 +219,17 @@ def main():
         check(rc == 4 and "is ready to lend" in err, "then ready, read with its key file: exit 4 (%d)" % rc)
         rc, err = n.validate(ATTIC_KEY="attic_0123456789abcdef01234567")
         check(rc == 4 and "is ready to lend" in err, "ATTIC_KEY works as well: exit 4 (%d)" % rc)
+        # S6: no default key. The prod daemon here is keyed with the compiled-in default itself, so a
+        # validator that falls back to spark-attic-1 would read its status and run on; with no fallback
+        # (the only honest behaviour) the check must refuse: it cannot read the daemon's status.
+        n2 = Node(bindir)
+        try:
+            n2.start_prod("--key", "spark-attic-1")
+            rc, err = n2.validate(ATTIC_KEY_FILE=os.path.join(n2.dir, "missing"), ATTIC_KEY="")
+            check(rc == 4 and "gave no status" in err,
+                  "no key anywhere: the default is not probed, the check refuses (%d) %s" % (rc, err[-200:]))
+        finally:
+            n2.done()
     finally:
         n.done()
 
@@ -184,6 +252,40 @@ def main():
         rc, err = n.validate()
         check(rc == 4 and "another carveout lender" in err, "another lender listening: exit 4 (%d)" % rc)
         other.close()
+    finally:
+        n.done()
+
+    # N3 update path: an install from before the 0600 rule leaves its reports world-readable - the old
+    # artifacts tree (.<driver>.old/check-heap.json) and FAILED-* reports the candidate dir kept. An
+    # update (a rerun of validate over the same driver) must leave no report readable by others.
+    n = Node(bindir)
+    try:
+        rc, err = n.validate()
+        check(rc == 0, "a first install passes (%d)" % rc)
+        art = os.path.join(n.lib, "artifacts", "999.0.1")
+        old_art = os.path.join(n.lib, "artifacts", ".999.0.1.old")
+        cands = os.path.join(n.lib, "candidates", "999.0.1")
+        # simulate the older install: chmod the installed reports and a kept FAILED report to 0644
+        os.chmod(os.path.join(art, "check-heap.json"), 0o644)
+        os.chmod(os.path.join(art, "check-list.json"), 0o644)
+        failed = os.path.join(cands, "FAILED-20261105T113115Z-list.json")
+        report = {"pass": False, "rc": 1, "error": "an earlier run report"}
+        with open(failed, "w") as f:
+            json.dump(report, f)
+            f.write("\n")
+        os.chmod(failed, 0o644)
+        rc, err = n.validate()
+        check(rc == 0, "an update over the old install passes (%d) %s" % (rc, err[-300:]))
+        check(not os.path.exists(os.path.join(old_art, "check-heap.json")),
+              ".old's check-heap.json is gone after the update (N3)")
+        check(not os.path.exists(os.path.join(old_art, "check-list.json")),
+              ".old's check-list.json is gone after the update (N3)")
+        check(oct(os.stat(failed).st_mode & 0o777) == "0o600",
+              "the kept FAILED-* report is 0600 after the update (N3)")
+        new_art = os.path.join(n.lib, "artifacts", "999.0.1")
+        for f in ("check-heap.json", "check-list.json"):
+            p = os.path.join(new_art, f)
+            check(oct(os.stat(p).st_mode & 0o777) == "0o600", "the new install's %s is 0600 (N3)" % f)
     finally:
         n.done()
     print("test_validate: %d failures" % len(FAILS))

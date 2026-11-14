@@ -79,11 +79,29 @@ def vllm():
     import vllm as v
 
     from spark_attic import vllm_plugin as p
-    from spark_attic._place import params
+    from spark_attic._place import params, Mismatch
 
     print("vllm %s" % v.__version__)
     entry_point("vllm.general_plugins")
-    for (mod, qual), want in p.EXPECTED.items():
+    # The shape whose every wrap target and call exists with the parameters the plugin knows - what the
+    # plugin picks in this image. The tables are per shape; the old flat iteration raised ValueError.
+    shape = None
+    whys = []
+    for cand in p.SHAPES:
+        try:
+            for (mod, qual), want in p.EXPECTED[cand].items():
+                got = params(resolve(mod, qual))
+                if got != want:
+                    raise Mismatch("%s.%s takes (%s); the plugin knows (%s)" % (mod, qual, ", ".join(got), ", ".join(want)))
+            shape = cand
+            break
+        except Exception as e:
+            whys.append("%s: %s" % (p.SHAPE_RELEASE[cand], e))
+    result(shape is not None, "the plugin picks vLLM shape %s%s" %
+           (shape or "none", "" if shape else " (none is a FAIL: %s)" % "; ".join(whys)))
+    if shape is None:
+        return
+    for (mod, qual), want in p.EXPECTED[shape].items():
         try:
             got = params(resolve(mod, qual))  # what the plugin reads, through torch.inference_mode and the like
         except Exception as e:
@@ -92,12 +110,13 @@ def vllm():
     from vllm.v1.kv_cache_interface import KVCacheTensor
 
     fields = set(getattr(KVCacheTensor, "__dataclass_fields__", {}))
-    result(fields == p.KV_TENSOR_FIELDS, "KVCacheTensor's fields: %s" % sorted(fields))
-    init = resolve(p.ATTN_V2, "init_kv_cache")
-    result(p._calls(init, "_allocate_kv_cache") and resolve(p.RUNNER_V2, "init_kv_cache") is init,
-           "the V2 runner allocates through %s.init_kv_cache -> _allocate_kv_cache" % p.ATTN_V2)
-    result(p._calls(resolve(p.RUNNER_V1, "GPUModelRunner.initialize_kv_cache_tensors"), "_allocate_kv_cache_tensors"),
-           "the V1 runner's initialize_kv_cache_tensors calls _allocate_kv_cache_tensors")
+    result(fields == p.KV_TENSOR_FIELDS[shape], "KVCacheTensor's fields (shape %s): %s" % (shape, sorted(fields)))
+    if shape == "0.24":
+        init = resolve(p.ATTN_V2, "init_kv_cache")
+        result(p._calls(init, "_allocate_kv_cache") and resolve(p.RUNNER_V2, "init_kv_cache") is init,
+               "the V2 runner allocates through %s.init_kv_cache -> _allocate_kv_cache" % p.ATTN_V2)
+        result(p._calls(resolve(p.RUNNER_V1, "GPUModelRunner.initialize_kv_cache_tensors"), "_allocate_kv_cache_tensors"),
+               "the V1 runner's initialize_kv_cache_tensors calls _allocate_kv_cache_tensors")
 
 
 def sglang():
@@ -107,9 +126,15 @@ def sglang():
 
     print("sglang %s" % getattr(s, "__version__", "?"))
     entry_point("sglang.srt.plugins")
-    for key, (target, want) in list(p.TARGETS.items()) + list(p.CALLS.items()):
+    # The shape the plugin picks in this image (the plugin's own picker), then only that shape's checks.
+    shape, why = p._kv_shape(("profile", "cap", "pools", "buffers"), ("configurator", "pool_sizes"))
+    result(shape is not None, "the plugin picks SGLang shape %s%s" %
+           (shape or "none", "" if shape else " (none is a FAIL: %s)" % why))
+    if shape is None:
+        return
+    for key, (target, want) in list(p.TARGETS[shape].items()) + list(p.CALLS[shape].items()):
         try:
-            p._check(key)
+            p._check(key, shape=shape)
             result(True, "%s(%s)" % (target, ", ".join(want)))
         except Exception as e:
             result(False, "%s: %s" % (target, e))

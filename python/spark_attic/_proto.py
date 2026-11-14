@@ -8,7 +8,6 @@ import socket
 from dataclasses import dataclass
 
 DEFAULT_SOCK = "/run/spark-attic/attic.sock"
-DEFAULT_KEY = "spark-attic-1"
 SLICE = 2 << 20  # atticd lends whole 2 MiB slices
 KEY_MAX = 127
 REPLY_MAX = 4096
@@ -26,7 +25,7 @@ def key_ok(key):
 @dataclass(frozen=True)
 class Settings:
     sock: str = DEFAULT_SOCK
-    key: str = DEFAULT_KEY
+    key: str = ""  # no compiled-in default: set it, or let from_env read the environment
     timeout: float = 5.0  # seconds, for connect and every reply
 
     @classmethod
@@ -40,7 +39,9 @@ class Settings:
                     key = f.read().strip()
             except OSError as e:
                 raise AtticError("SPARK_ATTIC_KEY_FILE %s: %s" % (env["SPARK_ATTIC_KEY_FILE"], e.strerror))
-        key = key or DEFAULT_KEY
+        if not key:
+            raise AtticError("no key: set SPARK_ATTIC_KEY or SPARK_ATTIC_KEY_FILE (atticd runs with none compiled "
+                             "in: it refuses to start without one)")
         if not key_ok(key):
             raise AtticError("the attic key is not one we can send (1 to %d printable bytes, no space, quote or "
                              "backslash)" % KEY_MAX)

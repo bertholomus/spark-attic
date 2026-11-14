@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright 2026 bertholomus
-"""test_sglang_plugin.py: spark_attic's SGLang plugin on a host with no GPU and no SGLang. SGLang 0.5.14's own plugin
-loader and hook registry (sglang/srt/plugins/__init__.py and hook_registry.py, linked from --sglang-src) run over a
-stand-in SGLang tree in a temp dir, which carries the functions the plugin hooks or calls with SGLang 0.5.14's
-parameters and a pocket version of their logic: the model runner's KV sizing chain (profile, configurator, the
-max_total_tokens cap), the plain MHA pool's _create_buffers, and ModelRunner.load_model. The stand-in torch keeps
-tensor bytes in host memory or, for the carveout, in the fake libcuda's; atticd runs with the fake RM shim, as in
-test_python.py.
+"""test_sglang_plugin.py: spark_attic's SGLang plugin on a host with no GPU and no SGLang. SGLang's own plugin loader
+and hook registry (sglang/srt/plugins/__init__.py and hook_registry.py, linked from --sglang-src when a tree is given;
+a pocket pair with the same register/apply shape otherwise) run over a stand-in SGLang tree in a temp dir, which
+carries the functions the plugin hooks or calls with the parameters of the SGLang shape it stands for and a pocket
+version of their logic. Both supported shapes run: the 0.5.14 tree (the model runner's KV mixin, one torch.zeros per K
+and V buffer) and the 0.5.23 tree (the KV configurator, one fused torch.zeros per layer with K and V views of it). The
+stand-in torch keeps tensor bytes in host memory or, for the carveout, in the fake libcuda's; atticd runs with the
+fake RM shim, as in test_python.py.
 
-    python3 -I tests/test_sglang_plugin.py --bin build/host --sglang-src cache/upstream/sglang-0.5.14
+    python3 -I tests/test_sglang_plugin.py --bin build/host [--sglang-src DIR]...
 
-The last case checks that SGLang's own source still has what the plugin hooks and reads.
+--sglang-src (repeatable) adds the check that a real SGLang source tree still has what the plugin hooks and reads for
+its shape; without it that case is skipped, and every other case still runs (the stand-in tree then carries the pocket
+plugin loader and hook registry).
 """
 import argparse
 import ast
@@ -34,12 +37,80 @@ from test_vllm_plugin import LOGS, SMALL, env_for, lent, pattern  # noqa: E402
 from spark_attic import sglang_plugin  # noqa: E402
 from fake_torch import TORCH, Model  # noqa: E402
 
-SGLANG_SRC = None
+SGLANG_SRCS = []
 
 
 # --------------------------------------------------------------------------------------- a stand-in SGLang tree
 
 PKG = "\n"
+# A pocket SGLang plugin framework, for the runs without --sglang-src: the register/apply shape the plugin uses,
+# so every case but case_upstream runs on the stand-in tree alone (case_upstream keeps the real pair honest).
+POCKET_HOOK_REGISTRY = '''import functools
+import pkgutil
+from enum import Enum
+
+
+class HookSource:
+    def __init__(self, plugin_name, dist_name):
+        self.plugin_name, self.dist_name = plugin_name, dist_name
+
+
+class HookType(Enum):
+    BEFORE = "before"
+    AFTER = "after"
+    AROUND = "around"
+    REPLACE = "replace"
+
+
+class HookRegistry:
+    _hooks = {}
+    _patched = set()
+
+    @classmethod
+    def register(cls, target, hook, hook_type=HookType.AFTER):
+        cls._hooks.setdefault(target, []).append((hook_type, hook))
+
+    @classmethod
+    def apply_hooks(cls):
+        for target, hooks in cls._hooks.items():
+            if target in cls._patched:
+                continue
+            obj_path, attr = target.rsplit(".", 1)
+            obj = pkgutil.resolve_name(obj_path)
+            original = getattr(obj, attr)
+            for hook_type, hook in hooks:
+                if hook_type is HookType.AROUND:
+                    original = _around(original, hook)
+            setattr(obj, attr, original)
+            cls._patched.add(target)
+
+
+def _around(original, hook):
+    @functools.wraps(original)
+    def wrapper(*args, **kwargs):
+        return hook(original, *args, **kwargs)
+    return wrapper
+'''
+POCKET_PLUGINS = '''from importlib.metadata import entry_points
+
+from sglang.srt.plugins.hook_registry import HookRegistry
+
+GENERAL_PLUGINS_GROUP = "sglang.srt.plugins"
+_loaded = False
+
+
+def load_plugins():
+    global _loaded
+    if _loaded:
+        return
+    _loaded = True
+    for ep in entry_points(group=GENERAL_PLUGINS_GROUP):
+        try:
+            ep.load()()
+        except Exception:
+            pass
+    HookRegistry.apply_hooks()
+'''
 ENVIRON = '''import os
 
 
@@ -68,6 +139,11 @@ def get_world_group():
 '''
 MODEL_CONFIG = '''def is_deepseek_v4(config) -> bool:
     return getattr(config, "dsv4", False)
+
+
+def is_minimax_sparse(config) -> bool:
+    return (config.architectures or [None])[0] in ("MiniMaxM3SparseForCausalLM",
+                                                   "MiniMaxM3SparseForConditionalGeneration")
 '''
 PLATFORMS = '''class _Platform:
     out_of_tree = False
@@ -225,12 +301,258 @@ def create_memory_pool_configurator(mr):
 SIZES_PARAMS = "self, available_bytes: int, page_size: int"
 
 
-def tree(k_shape=K_SHAPE, buffers_params="self", sizes_params=SIZES_PARAMS):
-    up = os.path.join(SGLANG_SRC, "python", "sglang", "srt", "plugins")
+# ----------------------------------------------------------------------------------------- the 0.5.23 stand-in tree
+
+SCHEDULE_23 = '''import types
+
+SCHEDULE = types.SimpleNamespace(max_total_tokens=None, page_size=16, mem_fraction_static=0.9)
+MEMORY = types.SimpleNamespace(enable_page_major_kv_layout=False)
+
+
+def get_schedule():
+    return SCHEDULE
+
+
+def get_memory():
+    return MEMORY
+'''
+RUNNER_MIN_23 = '''import types
+
+
+class Spec:
+    def __init__(self, name=None):
+        self.name = name
+
+    def is_none(self):
+        return self.name is None
+
+
+class ModelRunner:
+    def __init__(self, model=None):
+        self.model = model
+
+    def load_model(self):
+        self.weight_bytes = sum(p.numel() * p.element_size() for _, p in self.model.named_parameters())
+'''
+CONF_23 = '''import types
+
+import torch
+
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, OtherKVPool
+from sglang.srt.model_executor.model_runner import Spec
+
+
+class _InitializedPools:
+    def __init__(self, token_to_kv_pool):
+        self.token_to_kv_pool = token_to_kv_pool
+
+
+class KVCacheConfigurator:
+    def __init__(self, model, total_memory, **over):
+        self.model, self.total_memory = model, total_memory
+        self.server_args = types.SimpleNamespace(attention_backend="flashinfer", prefill_only_disable_kv_cache=False,
+                                                 enable_memory_saver=False, disaggregation_mode="null")
+        self.model_config = types.SimpleNamespace(hf_config=types.SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+                                                  head_dim=128, v_head_dim=128)
+        self.device, self.gpu_id = "cuda", 0
+        self.use_mla_backend = self.is_hybrid_swa = self.is_draft_worker = False
+        self.mambaish_config = None
+        self.spec_algorithm = Spec()
+        self.kv_cache_dtype = torch.bfloat16
+        self.page_size, self.head_num, self.head_dim, self.num_effective_layers = 16, 8, 128, 4
+        self.pool_kind = "mha"
+        self.post_capture_kv_active = False
+        self.token_to_kv_pool = None
+        for k, v in over.items():
+            setattr(self, k, v)
+
+    @torch.inference_mode()
+    def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
+        # SGLang's sum, pocket size: free memory now (on a GB10: what the system has available)
+        return int(self.total_memory - torch.cuda.memory_allocated())
+
+    def _apply_token_constraints(self, token_capacity: int) -> int:
+        from sglang.srt.runtime_context import get_schedule
+
+        user_limit = get_schedule().max_total_tokens
+        if user_limit is not None:
+            token_capacity = min(token_capacity, user_limit)
+        return token_capacity
+
+    def _resolve_memory_pool_config(self, pre_model_load_memory: int):
+        from sglang.srt.model_executor.pool_configurator import create_memory_pool_configurator
+
+        available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        configurator = create_memory_pool_configurator(self)
+        config = configurator.calculate_pool_sizes(available_bytes, self.page_size)
+        constrained = self._apply_token_constraints(config.max_total_num_tokens)
+        if constrained != config.max_total_num_tokens:
+            config = configurator.calculate_pool_sizes_from_max_tokens(constrained, self.page_size)
+        return config
+
+    def _init_pools(self, *, sizes, req_to_token_pool, token_to_kv_pool_allocator):
+        cls = OtherKVPool if self.pool_kind == "other" else MHATokenToKVPool
+        self.token_to_kv_pool = cls(
+            self.max_total_num_tokens, page_size=self.page_size, dtype=self.kv_cache_dtype, head_num=self.head_num,
+            head_dim=self.head_dim, v_head_dim=self.head_dim, layer_num=self.num_effective_layers,
+            device=self.device, enable_memory_saver=self.server_args.enable_memory_saver)
+        return _InitializedPools(self.token_to_kv_pool)
+
+    def configure(self, *, pre_model_load_memory: int):
+        self.max_total_num_tokens = self._resolve_memory_pool_config(pre_model_load_memory).max_total_num_tokens
+        return self._init_pools(sizes=None, req_to_token_pool=None, token_to_kv_pool_allocator=None)
+'''
+POOL_23 = '''from contextlib import nullcontext
+
+import torch
+
+
+class _NoSaver:
+    def region(self, tag):
+        return nullcontext()
+
+
+class KVCache:
+    def __init__(self, size, page_size, dtype, layer_num, device, enable_memory_saver):
+        self.size, self.page_size, self.dtype, self.device = size, page_size, dtype, device
+        self.store_dtype = dtype
+        self.layer_num = layer_num
+        self.memory_saver_adapter = _NoSaver()
+        self.enable_custom_mem_pool, self.custom_mem_pool = False, None
+
+
+class MHATokenToKVPool(KVCache):
+    def __init__(self, size, page_size, dtype, head_num, head_dim, layer_num, device, enable_memory_saver,
+                 v_head_dim=None):
+        super().__init__(size, page_size, dtype, layer_num, device, enable_memory_saver)
+        self.head_num, self.head_dim = head_num, head_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        self.kv_cache_layout = "nhd"
+        self.use_hnd = False
+        self.is_quantized_kv_cache = False
+        self.post_capture_active = False
+        self._create_buffers()
+
+    def _kv_buffer_shapes(self):
+        rows = self.size + self.page_size
+        return (rows, self.head_num, self.head_dim), (rows, self.head_num, self.v_head_dim)
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region("kv_cache"):
+            with (torch.cuda.use_mem_pool(self.custom_mem_pool) if self.enable_custom_mem_pool else nullcontext()):
+                k_shape, v_shape = self._kv_buffer_shapes()
+
+                def _zeros(shape):
+                    return torch.zeros(shape, dtype=self.store_dtype, device=self.device)
+
+                if k_shape == v_shape:
+                    # as in SGLang 0.5.23: K and V of a layer share one fused allocation, views of it
+                    rows = k_shape[0]
+                    padded = rows
+                    self.k_buffer, self.v_buffer, self.fused = [], [], []
+                    for _ in range(self.layer_num):
+                        buf = _zeros((2, padded, *k_shape[1:]))
+                        self.fused.append(buf)
+                        self.k_buffer.append(buf[0, :rows])
+                        self.v_buffer.append(buf[1, :rows])
+                else:
+                    self.k_buffer = [_zeros(k_shape) for _ in range(self.layer_num)]
+                    self.v_buffer = [_zeros(v_shape) for _ in range(self.layer_num)]
+        self.data_ptrs = [x.data_ptr() for x in self.k_buffer + self.v_buffer]
+
+
+class OtherKVPool(MHATokenToKVPool):
+    """A pool kind the plugin does not fill: buffers of its own."""
+
+    def _create_buffers(self):
+        shape = (self.size + self.page_size, self.head_num, self.head_dim)
+        self.k_buffer = [torch.zeros(shape, dtype=self.store_dtype, device=self.device) for _ in range(self.layer_num)]
+        self.v_buffer = [torch.zeros(shape, dtype=self.store_dtype, device=self.device) for _ in range(self.layer_num)]
+'''
+CONFIGURATOR_23 = '''class MemoryPoolConfig:
+    def __init__(self, max_total_num_tokens):
+        self.max_total_num_tokens = max_total_num_tokens
+
+
+class DefaultPoolConfigurator:
+    def __init__(self, kvc):
+        self._cell_size = kvc.num_effective_layers * 2 * kvc.head_num * kvc.head_dim * kvc.kv_cache_dtype.itemsize
+
+    def calculate_pool_sizes(self, available_bytes: int, page_size: int):
+        return MemoryPoolConfig(available_bytes // self._cell_size // page_size * page_size)
+
+    def calculate_pool_sizes_from_max_tokens(self, max_total_num_tokens: int, page_size: int):
+        return MemoryPoolConfig(max_total_num_tokens // page_size * page_size)
+
+
+def create_memory_pool_configurator(kvc):
+    return DefaultPoolConfigurator(kvc)
+'''
+
+
+POOL_21 = POOL_23.replace('''
+                if k_shape == v_shape:
+                    # as in SGLang 0.5.23: K and V of a layer share one fused allocation, views of it
+                    rows = k_shape[0]
+                    padded = rows
+                    self.k_buffer, self.v_buffer, self.fused = [], [], []
+                    for _ in range(self.layer_num):
+                        buf = _zeros((2, padded, *k_shape[1:]))
+                        self.fused.append(buf)
+                        self.k_buffer.append(buf[0, :rows])
+                        self.v_buffer.append(buf[1, :rows])
+                else:
+                    self.k_buffer = [_zeros(k_shape) for _ in range(self.layer_num)]
+                    self.v_buffer = [_zeros(v_shape) for _ in range(self.layer_num)]
+''', '''
+                # as in SGLang 0.5.21: K and V of a layer are their own allocations, K's for all layers first
+                self.k_buffer = [_zeros(k_shape) for _ in range(self.layer_num)]
+                self.v_buffer = [_zeros(v_shape) for _ in range(self.layer_num)]
+''')
+assert "fused" not in POOL_21.split("data_ptrs")[0].split("class OtherKVPool")[0]
+
+
+def plugins_files():
+    """SGLang's own plugin loader and hook registry when --sglang-src gives a tree, else the pocket pair with the
+    same register/apply shape: every case but case_upstream runs without the upstream trees."""
+    up = os.path.join(SGLANG_SRCS[0], "python", "sglang", "srt", "plugins") if SGLANG_SRCS else None
+    if up is None:
+        return {"sglang/srt/plugins/__init__.py": POCKET_PLUGINS,
+                "sglang/srt/plugins/hook_registry.py": POCKET_HOOK_REGISTRY}
+    return {"sglang/srt/plugins/__init__.py": ("link", os.path.join(up, "__init__.py")),
+            "sglang/srt/plugins/hook_registry.py": ("link", os.path.join(up, "hook_registry.py"))}
+
+
+def tree21():
+    """The 0.5.21-shaped stand-in: 0.5.23's hook surface (the configurator owns the sizing chain) but
+    the plain MHA pool allocates K and V separately, as 0.5.21's _create_buffers_normal does."""
+    t = tree23()
+    t["sglang/srt/mem_cache/memory_pool.py"] = POOL_21
+    return t
+
+
+def tree23():
+    """The 0.5.23-shaped stand-in: the KV configurator owns the sizing chain, the pool fuses K and V."""
     return {
         "sglang/__init__.py": PKG, "sglang/srt/__init__.py": PKG, "sglang/srt/environ.py": ENVIRON,
-        "sglang/srt/plugins/__init__.py": ("link", os.path.join(up, "__init__.py")),
-        "sglang/srt/plugins/hook_registry.py": ("link", os.path.join(up, "hook_registry.py")),
+        **plugins_files(),
+        "sglang/srt/configs/__init__.py": PKG, "sglang/srt/configs/model_config.py": MODEL_CONFIG,
+        "sglang/srt/platforms/__init__.py": PLATFORMS,
+        "sglang/srt/distributed/__init__.py": PKG, "sglang/srt/distributed/parallel_state.py": PARALLEL_STATE,
+        "sglang/srt/runtime_context.py": SCHEDULE_23,
+        "sglang/srt/model_executor/__init__.py": PKG,
+        "sglang/srt/model_executor/model_runner.py": RUNNER_MIN_23,
+        "sglang/srt/model_executor/pool_configurator.py": CONFIGURATOR_23,
+        "sglang/srt/mem_cache/__init__.py": PKG,
+        "sglang/srt/mem_cache/kv_cache_configurator.py": CONF_23,
+        "sglang/srt/mem_cache/memory_pool.py": POOL_23,
+    }
+
+
+def tree(k_shape=K_SHAPE, buffers_params="self", sizes_params=SIZES_PARAMS):
+    return {
+        "sglang/__init__.py": PKG, "sglang/srt/__init__.py": PKG, "sglang/srt/environ.py": ENVIRON,
+        **plugins_files(),
         "sglang/srt/configs/__init__.py": PKG, "sglang/srt/configs/model_config.py": MODEL_CONFIG,
         "sglang/srt/platforms/__init__.py": PLATFORMS,
         "sglang/srt/distributed/__init__.py": PKG, "sglang/srt/distributed/parallel_state.py": PARALLEL_STATE,
@@ -261,9 +583,10 @@ class World:
 class Sgl:
     """A fresh stand-in SGLang on sys.path, a fresh plugin state, and SGLang's own load_plugins() run over it."""
 
-    def __init__(self, env, files=None, world=None):
+    def __init__(self, env, files=None, world=None, kind="0514"):
         for name in [n for n in sys.modules if n == "sglang" or n.startswith("sglang.")]:
             del sys.modules[name]
+        self.kind = kind
         self.dir = tempfile.mkdtemp(prefix="attic-sglang-")
         for rel, src in (files or tree()).items():
             path = os.path.join(self.dir, rel)
@@ -285,20 +608,37 @@ class Sgl:
             ps = importlib.import_module("sglang.srt.distributed.parallel_state")
             ps.WORLD.world_size, ps.WORLD.cpu_group = world.size, world
         importlib.import_module("sglang.srt.plugins").load_plugins()
-        self.mixin = importlib.import_module("sglang.srt.model_executor.model_runner_kv_cache_mixin")
+        if kind == "0514":
+            self.mixin = importlib.import_module("sglang.srt.model_executor.model_runner_kv_cache_mixin")
+        else:
+            self.conf = importlib.import_module("sglang.srt.mem_cache.kv_cache_configurator")
+            self.runtime = importlib.import_module("sglang.srt.runtime_context")
         self.mr = importlib.import_module("sglang.srt.model_executor.model_runner")
         self.pool = importlib.import_module("sglang.srt.mem_cache.memory_pool")
         self.platforms = importlib.import_module("sglang.srt.platforms")
 
     def wrapped(self):
         """What SGLang's hook registry wrapped: its wrapper's code is in hook_registry.py (a decorator's is not)."""
-        return {key for key, (target, _) in sglang_plugin.TARGETS.items()
-                if pkgutil.resolve_name(target).__code__.co_filename.endswith("hook_registry.py")}
+        out = set()
+        for shape in sglang_plugin.SHAPES:
+            for key, (target, _) in sglang_plugin.TARGETS[shape].items():
+                try:
+                    fn = pkgutil.resolve_name(target)
+                except Exception:
+                    continue
+                if getattr(fn, "__code__", None) and fn.__code__.co_filename.endswith("hook_registry.py"):
+                    out.add(key)
+        return out
 
     def runner(self, budget=100 * MIB, model=None, **over):
         """A model runner that measures `budget` bytes free once its model's weights are made."""
         gc.collect()  # what earlier cases left must not be freed in the middle of this one
         return self.mr.ModelRunner(model or Model([]), budget + TORCH.allocated, **over)
+
+    def configurator(self, budget=100 * MIB, model=None, **over):
+        """The 0.5.23 sizing object, which measures `budget` bytes free once its model's weights are made."""
+        gc.collect()
+        return self.conf.KVCacheConfigurator(model or Model([]), budget + TORCH.allocated, **over)
 
     def done(self):
         st = sglang_plugin.S
@@ -446,11 +786,15 @@ def case_kv_other_pool(rig):
     v = Sgl(env_for(rig))
     try:
         r = v.runner(pool_kind="other")
-        r.init_memory_pool(0)
-        p = r.token_to_kv_pool
-        check(all(t.kind == "buf" for t in p.k_buffer + p.v_buffer) and not sglang_plugin.S.keep,
-              "a pool kind the plugin does not fill: SGLang allocates it all")
-        check(LOGS.has("(OtherKVPool) took no carveout; it is 62 MiB over"), "and the log says by how much")
+        raised = None
+        try:
+            r.init_memory_pool(0)
+        except Exception as e:
+            raised = e
+        check(raised is not None and not sglang_plugin.S.keep,
+              "a pool kind the plugin does not fill: the engine stops coming up, it does not allocate 62 MiB more "
+              "than SGLang measured")
+        check(LOGS.has("took no carveout") and LOGS.has("not falling back"), "one line says why and what to do")
         inf = wait_free(rig.sock, 62 * MIB)
         check(inf and inf["free"] == 62 * MIB, "the unused slice went back at once: %r" % inf)
     finally:
@@ -462,10 +806,16 @@ def case_kv_miss(rig):
     v = Sgl(env_for(rig), tree(k_shape="(self.size, self.head_num, self.head_dim)"))
     try:
         r = v.runner()
-        r.init_memory_pool(0)
-        p = r.token_to_kv_pool
-        check(all(t.kind == "buf" for t in p.k_buffer + p.v_buffer), "an unplanned torch.zeros: nothing substituted")
-        check(LOGS.has("differently than planned (call 0: torch.zeros((10368, 8, 128)"), "logged with the call")
+        raised = None
+        try:
+            r.init_memory_pool(0)
+        except Exception as e:
+            raised = e
+        pool = getattr(r, "token_to_kv_pool", None)
+        check(raised is not None and (pool is None or all(t.kind == "buf" for t in pool.k_buffer)),
+              "an unplanned torch.zeros after the raise: the engine stops, nothing was substituted")
+        check(LOGS.has("differently than planned (call 0: torch.zeros((10368, 8, 128)") and LOGS.has(
+            "not falling back"), "logged with the call, and why the engine stops")
         inf = wait_free(rig.sock, 62 * MIB)
         check(not sglang_plugin.S.keep and inf and inf["free"] == 62 * MIB,
               "nothing points into the mapping: closed, the slice back at once: %r" % inf)
@@ -503,6 +853,121 @@ def case_blocked(rig):
             os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL", None)
             v.platforms.current_platform.out_of_tree = False
         check(lent(rig) == 0, "nothing lent")
+    finally:
+        v.done()
+
+
+def case_hnd(rig):
+    """An HND KV cache is not the plain nhd pool: the placement turns off before the budget is raised, with one
+    log line, and the engine starts."""
+    rig.start(env=SMALL)
+    v = Sgl(env_for(rig), tree23(), kind="0523")
+    try:
+        os.environ["SGLANG_USE_HND_KVCACHE"] = "1"
+        r = v.configurator()
+        check(r._profile_available_bytes(0) == measured(r) and LOGS.has("KV placement off: an HND KV cache"),
+              "an HND KV cache: no carveout added to the KV budget, one log line")
+        raised = None
+        try:
+            r.configure(pre_model_load_memory=0)
+        except Exception as e:
+            raised = e
+        check(raised is None and r.max_total_num_tokens == 6400 and lent(rig) == 0
+              and not LOGS.has("not falling back"),
+              "and the engine starts: the pool as SGLang sized it (%d tokens), no raise" % r.max_total_num_tokens)
+    finally:
+        os.environ.pop("SGLANG_USE_HND_KVCACHE", None)
+        v.done()
+
+
+def case_page_major(rig):
+    """The page-major pool class (--enable-page-major-kv-layout) is not the plain MHATokenToKVPool: off before the
+    budget is raised, with one log line, and the engine starts."""
+    rig.start(env=SMALL)
+    v = Sgl(env_for(rig), tree23(), kind="0523")
+    try:
+        v.runtime.MEMORY.enable_page_major_kv_layout = True
+        r = v.configurator()
+        check(r._profile_available_bytes(0) == measured(r) and LOGS.has("KV placement off: the page-major KV layout"),
+              "the page-major KV layout: no carveout added to the KV budget, one log line")
+        raised = None
+        try:
+            r.configure(pre_model_load_memory=0)
+        except Exception as e:
+            raised = e
+        check(raised is None and r.max_total_num_tokens == 6400 and lent(rig) == 0
+              and not LOGS.has("not falling back"),
+              "and the engine starts: the pool as SGLang sized it (%d tokens), no raise" % r.max_total_num_tokens)
+    finally:
+        v.done()
+
+
+def case_minimax_sparse(rig):
+    """A MiniMax-sparse model gets its own pool kind: off before the budget is raised, one log line, the engine
+    starts."""
+    rig.start(env=SMALL)
+    v = Sgl(env_for(rig), tree23(), kind="0523")
+    try:
+        r = v.configurator()
+        r.model_config.hf_config.architectures = ["MiniMaxM3SparseForCausalLM"]
+        check(r._profile_available_bytes(0) == measured(r) and LOGS.has("KV placement off: a MiniMax-sparse model"),
+              "a MiniMax-sparse model: no carveout added to the KV budget, one log line")
+        raised = None
+        try:
+            r.configure(pre_model_load_memory=0)
+        except Exception as e:
+            raised = e
+        check(raised is None and r.max_total_num_tokens == 6400 and lent(rig) == 0
+              and not LOGS.has("not falling back"),
+              "and the engine starts: the pool as SGLang sized it (%d tokens), no raise" % r.max_total_num_tokens)
+    finally:
+        v.done()
+
+
+def case_post_capture(rig):
+    """Post-capture KV sizing keeps buffers of its own (and an attribute the plugin cannot read counts as blocked):
+    off before the budget is raised, one log line, the engine starts."""
+    rig.start(env=SMALL)
+    v = Sgl(env_for(rig), tree23(), kind="0523")
+    try:
+        r = v.configurator(post_capture_kv_active=True)
+        check(r._profile_available_bytes(0) == measured(r) and LOGS.has("KV placement off: post-capture KV sizing"),
+              "post-capture KV sizing: no carveout added to the KV budget, one log line")
+        raised = None
+        try:
+            r.configure(pre_model_load_memory=0)
+        except Exception as e:
+            raised = e
+        check(raised is None and r.max_total_num_tokens == 6400 and lent(rig) == 0
+              and not LOGS.has("not falling back"),
+              "and the engine starts: the pool as SGLang sized it (%d tokens), no raise" % r.max_total_num_tokens)
+        del r.post_capture_kv_active
+        LOGS.lines.clear()
+        check(r._profile_available_bytes(0) == measured(r)
+              and LOGS.has("post_capture_kv_active cannot be read"),
+              "an attribute the plugin cannot read counts as blocked, not as a placement")
+    finally:
+        v.done()
+
+
+def case_unequal_head_dims(rig):
+    """K and V head sizes that differ are not the buffers the fused pool plans: off before the budget is raised, one
+    log line, and the engine starts."""
+    rig.start(env=SMALL)
+    v = Sgl(env_for(rig), tree23(), kind="0523")
+    try:
+        r = v.configurator()
+        r.model_config.v_head_dim = 64
+        check(r._profile_available_bytes(0) == measured(r) and LOGS.has("KV placement off: K and V head sizes differ"),
+              "unequal K and V head sizes: no carveout added to the KV budget, one log line")
+        raised = None
+        try:
+            r.configure(pre_model_load_memory=0)
+        except Exception as e:
+            raised = e
+        check(raised is None and r.max_total_num_tokens == 6400 and lent(rig) == 0
+              and not LOGS.has("not falling back"),
+              "and the engine starts: the pool as SGLang sized it (%d tokens), no raise" % r.max_total_num_tokens)
     finally:
         v.done()
 
@@ -587,6 +1052,146 @@ def case_drift(rig):
         v.done()
 
 
+def case_kv23(rig):
+    """The 0.5.23 shape: the configurator sizes, the pool fuses K and V, the carveout holds the tail."""
+    rig.start(env=SMALL)
+    v = Sgl(env_for(rig), tree23(), kind="0523")
+    try:
+        check(v.wrapped() == {"profile", "cap", "pools", "buffers"},
+              "kv on 0.5.23: SGLang's registry applied the four KV hooks: %r" % v.wrapped())
+        r = v.configurator()
+        check(measured(r) == 100 * MIB, "SGLang measures 100 MiB")
+        got = r._profile_available_bytes(0)
+        check(got == 162 * MIB and lent(rig) == 62 * MIB, "100 MiB measured + the 62 MiB lent: %d MiB" % (got // MIB))
+        r.configure(pre_model_load_memory=0)
+        check(r.max_total_num_tokens == 10368, "sized with the carveout: 10368 tokens, not 6400: %d"
+              % r.max_total_num_tokens)
+        p = r.token_to_kv_pool
+        rows = 10368 + 16
+        fused_bytes = 2 * rows * 8 * 128 * 2
+        check([t.kind for t in p.fused] == ["buf"] * 2 + ["va"] * 2,
+              "fused buffers 0-1 where SGLang puts them, 2-3 in the mapping: %r" % [t.kind for t in p.fused])
+        m = sglang_plugin.S.keep[0]
+        check(m.attic_bytes == 62 * MIB and p.k_buffer[2].data_ptr() == m.ptr
+              and p.v_buffer[2].data_ptr() == m.ptr + fused_bytes // 2
+              and p.k_buffer[3].data_ptr() == m.ptr + 42 * MIB,
+              "the fused buffers' K and V views land in the mapping: %r" % m)
+        check(all(t.shape == (rows, 8, 128) and t.dtype is TORCH.bfloat16 for t in p.k_buffer + p.v_buffer),
+              "every buffer keeps SGLang's shape and dtype")
+        check(m.read(0, 4096) == bytes(4096) and m.read(m.size - 4096, 4096) == bytes(4096), "the mapping is zeroed")
+        seam = TORCH.zeros(fused_bytes // 2)
+        data = pattern(8192, 7)
+        ctypes.memmove(ctypes.addressof(seam.buf), data, 8192)
+        p.k_buffer[3].copy_(seam)
+        check(m.read(42 * MIB, 8192) == data, "a write through SGLang's own view reads back in the carveout")
+        check(LOGS.has("KV buffers 2-3 of 4 (K and V fused, by layer)"), "logged")
+        LOGS.lines.clear()
+        check(r._profile_available_bytes(0) == measured(r) and LOGS.has("after building it"),
+              "sized again after the pool was built: no carveout")
+    finally:
+        v.done()
+    inf = wait_free(rig.sock, 62 * MIB)
+    check(inf and inf["free"] == 62 * MIB, "closed: all given back: %r" % inf)
+
+
+def case_kv21(rig):
+    """0.5.21: 0.5.23's hook signatures, but the pool allocates K and V separately. The buffers hook
+    follows the pool's own layout (read from its source before the budget is raised), so the placement
+    works exactly as on 0.5.14 - and a plugin that planned the fused layout here would raise after the
+    budget was raised (window 3's defect: the node's sglang-kv.log, Mismatch call 0)."""
+    rig.start(env=SMALL)
+    v = Sgl(env_for(rig), tree21(), kind="0523")
+    try:
+        check(v.wrapped() == {"profile", "cap", "pools", "buffers"},
+              "kv on 0.5.21: the registry applied the four KV hooks (the 0.5.23 surface): %r" % v.wrapped())
+        r = v.configurator()
+        got = r._profile_available_bytes(0)
+        check(got == 162 * MIB and lent(rig) == 62 * MIB, "100 MiB measured + the 62 MiB lent: %d MiB" % (got // MIB))
+        r.configure(pre_model_load_memory=0)
+        check(r.max_total_num_tokens == 10368, "sized with the carveout: 10368 tokens, not 6400: %d"
+              % r.max_total_num_tokens)
+        p = r.token_to_kv_pool
+        rows = 10368 + 16
+        check([t.kind for t in p.k_buffer] == ["buf"] * 4,
+              "every K buffer where SGLang puts it (device memory): %r" % [t.kind for t in p.k_buffer])
+        check([t.kind for t in p.v_buffer] == ["buf", "va", "va", "va"],
+              "the tail of the K-then-V order in the carveout: %r" % [t.kind for t in p.v_buffer])
+        check(all(t.shape == (rows, 8, 128) and t.dtype is TORCH.bfloat16 for t in p.k_buffer + p.v_buffer),
+              "every buffer keeps SGLang's shape and dtype")
+        m = sglang_plugin.S.keep[0]
+        check(m.attic_bytes == 62 * MIB and p.v_buffer[1].data_ptr() == m.ptr
+              and p.v_buffer[2].data_ptr() == m.ptr + 22 * MIB and p.v_buffer[3].data_ptr() == m.ptr + 44 * MIB,
+              "the V buffers land in the mapping in order (v1 across the seam): %r" % m)
+        check(m.read(0, 4096) == bytes(4096) and m.read(m.size - 4096, 4096) == bytes(4096),
+              "the mapping is zeroed")
+        seam = TORCH.zeros(rows * 8 * 128 * 2)
+        data = pattern(8192, 7)
+        ctypes.memmove(ctypes.addressof(seam.buf), data, 8192)
+        p.v_buffer[3].copy_(seam)
+        check(m.read(44 * MIB, 8192) == data, "a write through SGLang's own V view reads back in the carveout")
+        check(LOGS.has("KV buffers 5-7 of 8 (K then V, by layer)"), "logged")
+        LOGS.lines.clear()
+        check(r._profile_available_bytes(0) == measured(r) and LOGS.has("after building it"),
+              "sized again after the pool was built: no carveout")
+    finally:
+        v.done()
+    inf = wait_free(rig.sock, 62 * MIB)
+    check(inf and inf["free"] == 62 * MIB, "closed: all given back: %r" % inf)
+
+
+def case_cap23(rig):
+    """0.5.23: --max-total-tokens lives in the schedule; the carveout's tokens come on top of it."""
+    rig.start(env=SMALL)
+    v = Sgl(env_for(rig), tree23(), kind="0523")
+    try:
+        r = v.configurator()
+        v.runtime.SCHEDULE.max_total_tokens = 4000
+        r.configure(pre_model_load_memory=0)
+        check(r.max_total_num_tokens == 7968 and v.runtime.SCHEDULE.max_total_tokens == 4000,
+              "a binding cap of 4000 tokens + the 62 MiB carveout's 3968 tokens of 16 KiB: %d; the cap restored: %r"
+              % (r.max_total_num_tokens, v.runtime.SCHEDULE.max_total_tokens))
+        check(LOGS.has("max_total_tokens=4000 holds the KV pool's device memory"), "logged")
+        p = r.token_to_kv_pool
+        check(sum(1 for t in p.fused if t.kind == "va") == 2, "the last two fused buffers in the carveout")
+        m = sglang_plugin.S.keep[0]
+        check(m.attic_bytes == 62 * MIB and m.size - m.attic_bytes == 2 * MIB,
+              "device memory holds %d MiB; the carveout stands in for the rest of the pool's bytes"
+              % ((m.size - m.attic_bytes) // MIB))
+    finally:
+        v.done()
+    wait_free(rig.sock, 62 * MIB)
+    v = Sgl(env_for(rig), tree23(), kind="0523")
+    try:
+        r = v.configurator()
+        v.runtime.SCHEDULE.max_total_tokens = 20000
+        r.configure(pre_model_load_memory=0)
+        check(r.max_total_num_tokens == 10368 and not LOGS.has("holds the KV pool's device memory"),
+              "a cap over the measured memory + the carveout does not bind")
+    finally:
+        v.done()
+    wait_free(rig.sock, 62 * MIB)
+
+
+def case_s2_23(rig):
+    """0.5.23: the budget was raised and the pool is not the kind the plugin fills: the engine stops."""
+    rig.start(env=SMALL)
+    v = Sgl(env_for(rig), tree23(), kind="0523")
+    try:
+        r = v.configurator(pool_kind="other")
+        raised = None
+        try:
+            r.configure(pre_model_load_memory=0)
+        except Exception as e:
+            raised = e
+        check(raised is not None and not sglang_plugin.S.keep,
+              "a pool kind the plugin does not fill: the engine stops coming up, it does not allocate 62 MiB more")
+        check(LOGS.has("took no carveout") and LOGS.has("not falling back"), "one line says why and what to do")
+        inf = wait_free(rig.sock, 62 * MIB)
+        check(inf and inf["free"] == 62 * MIB, "the unused slice went back at once: %r" % inf)
+    finally:
+        v.done()
+
+
 def case_ranks(rig):
     rig.start(env=SMALL)
     w = World(2, [40 * MIB, 40 * MIB])
@@ -622,9 +1227,9 @@ def case_ranks(rig):
         v.done()
 
 
-def case_upstream(rig):
-    """SGLang's own source (--sglang-src) still has what the plugin hooks and reads."""
-    src = os.path.join(SGLANG_SRC, "python")
+def _upstream_helpers(src):
+    """The AST readers the upstream cases share, bound to one source tree's python/ directory."""
+    import types as _types
 
     def parse(mod):
         path = os.path.join(src, *mod.split("."))
@@ -664,24 +1269,49 @@ def case_upstream(rig):
                 return ".".join(parts[:i]), ".".join(parts[i:])
         raise ValueError(target)
 
-    for key, (target, want) in list(sglang_plugin.TARGETS.items()) + list(sglang_plugin.CALLS.items()):
-        fn = find(parse(split(target)[0]), split(target)[1])
-        check(fn is not None and params(fn) == want, "%s: (%s) as the plugin expects: %r"
-              % (target, ", ".join(want), fn and params(fn)))
-        decos = [ast.unparse(d) for d in fn.decorator_list] if fn else []
-        check(set(decos) <= {"torch.inference_mode()"}, "%s: decorators that keep its parameters, read through: %r"
-              % (target, decos))
+    return _types.SimpleNamespace(parse=parse, find=find, params=params, names=names, calls=calls, stores=stores,
+                                  split=split)
 
-    # the plugin's entry point group, and SGLang loads it before it builds the model runner
-    pl = parse("sglang.srt.plugins")
-    groups = {ast.unparse(n.targets[0]): n.value.value for n in pl.body if isinstance(n, ast.Assign)
-              and isinstance(n.value, ast.Constant)}
-    check(groups.get("GENERAL_PLUGINS_GROUP") == "sglang.srt.plugins", "the plugin group: %r" % groups)
-    check("HookRegistry.apply_hooks" in calls(find(pl, "load_plugins")), "load_plugins applies the hooks")
-    rsp = find(parse("sglang.srt.managers.scheduler"), "run_scheduler_process")
-    check(ast.unparse(rsp.body[0]) == "load_plugins()", "the scheduler process loads plugins first thing")
 
-    # the sizing chain: profile -> pool sizes -> _init_pools -> MHATokenToKVPool, in the mixin, unchanged by the runner
+def case_upstream(rig):
+    """SGLang's own source (--sglang-src, repeatable) still has what the plugin hooks and reads for its shape."""
+    if not SGLANG_SRCS:
+        print("  skip: no --sglang-src")
+        return
+    for root in SGLANG_SRCS:
+        src = os.path.join(os.path.abspath(root), "python")
+        tag = os.path.basename(root.rstrip("/"))
+        h = _upstream_helpers(src)
+        shape = "0.5.23" if os.path.isfile(os.path.join(src, "sglang", "srt", "mem_cache",
+                                                        "kv_cache_configurator.py")) else "0.5.14"
+        check(shape in sglang_plugin.TARGETS, "%s: a shape the plugin knows (%s)" % (tag, shape))
+        for key, (target, want) in (list(sglang_plugin.TARGETS[shape].items())
+                                    + list(sglang_plugin.CALLS[shape].items())):
+            fn = h.find(h.parse(h.split(target)[0]), h.split(target)[1])
+            check(fn is not None and h.params(fn) == want, "%s: %s: (%s) as the plugin expects: %r"
+                  % (tag, target, ", ".join(want), fn and h.params(fn)))
+            decos = [ast.unparse(d) for d in fn.decorator_list] if fn else []
+            check(set(decos) <= {"torch.inference_mode()"}, "%s: %s: decorators that keep its parameters, read "
+                  "through: %r" % (tag, target, decos))
+
+        # the plugin's entry point group, and SGLang loads it before it builds the model runner
+        pl = h.parse("sglang.srt.plugins")
+        groups = {ast.unparse(n.targets[0]): n.value.value for n in pl.body if isinstance(n, ast.Assign)
+                  and isinstance(n.value, ast.Constant)}
+        check(groups.get("GENERAL_PLUGINS_GROUP") == "sglang.srt.plugins", "%s: the plugin group: %r" % (tag, groups))
+        check("HookRegistry.apply_hooks" in h.calls(h.find(pl, "load_plugins")), "%s: load_plugins applies the hooks"
+              % tag)
+        rsp = h.find(h.parse("sglang.srt.managers.scheduler"), "run_scheduler_process")
+        check("load_plugins" in h.calls(rsp), "%s: the scheduler process loads plugins first thing" % tag)
+        if shape == "0.5.14":
+            _upstream_0514(src, h, tag)
+        else:
+            _upstream_0523(src, h, tag)
+
+
+def _upstream_0514(src, h, tag):
+    """The 0.5.14 source has the mixin chain and the one-zeros-per-buffer pool the plugin plans around."""
+    parse, find, names, calls, stores, split = h.parse, h.find, h.names, h.calls, h.stores, h.split
     mixin = parse("sglang.srt.model_executor.model_runner_kv_cache_mixin")
     m = "ModelRunnerKVCacheMixin."
     check("self._resolve_memory_pool_config" in calls(find(mixin, m + "init_memory_pool"))
@@ -765,20 +1395,112 @@ def case_upstream(rig):
                                   if isinstance(f, ast.FunctionDef)}, "parallel_state.get_world_group")
 
 
-CASES = [case_entry_point, case_settings, case_kv, case_cap, case_kv_other_pool, case_kv_miss, case_blocked,
-         case_weights, case_weights_and_kv, case_fail_open, case_drift, case_ranks, case_upstream]
+def _upstream_0523(src, h, tag):
+    """The 0.5.23 source has the configurator chain and the fused-buffer pool the plugin plans around."""
+    parse, find, names, calls, stores = h.parse, h.find, h.names, h.calls, h.stores
+
+    # the sizing chain: profile -> config_from_budget (pool sizes, then the cap), in the configurator
+    conf = parse("sglang.srt.mem_cache.kv_cache_configurator")
+    c = "KVCacheConfigurator."
+    rmp = find(conf, c + "_resolve_memory_pool_config")
+    at = [ast.unparse(rmp).find(x) for x in ("available_bytes = self._profile_available_bytes(",
+                                             "config = self.config_from_budget(available_bytes)")]
+    cfb = find(conf, c + "config_from_budget")
+    at += [ast.unparse(cfb).find(x) for x in ("configurator = create_memory_pool_configurator(self)",
+                                              "config = configurator.calculate_pool_sizes(",
+                                              "max_tokens = self._apply_token_constraints(config.max_total_num_tokens")]
+    check(-1 not in at and at == sorted(at), "%s: _resolve_memory_pool_config: the profiled bytes go through "
+          "config_from_budget: pool sizes in the configurator, then the cap: %r" % (tag, at))
+    atc = find(conf, c + "_apply_token_constraints")
+    check("get_schedule().max_total_tokens" in ast.unparse(atc),
+          "%s: _apply_token_constraints reads the cap through get_schedule()" % tag)
+    confure = find(conf, c + "configure")
+    check("self._resolve_memory_pool_config" in calls(confure) and "self._init_pools" in calls(confure),
+          "%s: configure sizes with _profile_available_bytes, then builds with _init_pools" % tag)
+    check("token_to_kv_pool" in names(find(conf, c + "_init_pools")),
+          "%s: _init_pools builds the token pool" % tag)
+    pc = parse("sglang.srt.model_executor.pool_configurator")
+    cps = find(pc, "DefaultPoolConfigurator.calculate_pool_sizes")
+    check("max_total_num_tokens = (\n            available_bytes // self._cell_size" in ast.unparse(cps)
+          or "available_bytes // self._cell_size" in ast.unparse(cps),
+          "%s: the default configurator's tokens are bytes // cell size, so the carveout's bytes count" % tag)
+    check(any(ast.unparse(n) == "create_memory_pool_configurator(self)" for n in ast.walk(cfb)
+              if isinstance(n, ast.Call)),
+          "%s: the configurator is built from the KVCacheConfigurator" % tag)
+
+    # what the plugin reads off the configurator
+    fields = {n.target.id for n in find(conf, "KVCacheConfigurator").body
+              if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)}
+    need = {"device", "gpu_id", "model_config", "server_args", "kv_cache_dtype", "page_size", "spec_algorithm",
+            "is_draft_worker", "is_hybrid_swa", "use_mla_backend", "mambaish_config"}
+    check(need <= fields, "%s: KVCacheConfigurator has what the plugin reads; missing: %r" % (tag, need - fields))
+    check(find(parse("sglang.srt.model_executor.model_runner"), "ModelRunner.load_model") is not None,
+          "%s: ModelRunner.load_model (the weights hook)" % tag)
+
+    # the plain MHA pool: the plugin reads the buffer layout from this very source, so the rule must
+    # name what the tag does - the fused (2, padded, ...) allocation (0.5.22+) or separate K and V
+    # (0.5.14, 0.5.21: its hook signatures match 0.5.23's, so only the source tells the layouts apart)
+    pool = parse("sglang.srt.mem_cache.memory_pool")
+    cbn = find(pool, "MHATokenToKVPool._create_buffers_normal")
+    fused = [n for n in ast.walk(cbn) if isinstance(n, ast.Call)
+             and ast.unparse(n.func) == "_zeros" and "_zeros((2, padded, *k_shape[1:]))" in ast.unparse(n)]
+    text = ast.unparse(cbn)
+    separate = "torch.zeros(k_shape" in text and "torch.zeros(v_shape" in text
+    check(sglang_plugin._layout_rule(cbn) == ("fused" if fused else "separate"),
+          "%s: the plugin's layout rule reads this pool as %s" % (tag, "fused" if fused else "separate"))
+    if fused:
+        check(len(fused) == 1, "%s: one fused _zeros((2, padded, *k_shape[1:])) per layer: %d" % (tag, len(fused)))
+        check("self.k_buffer = [buf[0, :rows] for buf in fused]" in text
+              and "self.v_buffer = [buf[1, :rows] for buf in fused]" in text,
+              "%s: the pool keeps buf[0, :rows] and buf[1, :rows] views of the fused allocation" % tag)
+    else:
+        check(separate, "%s: the pool allocates K and V separately (the buffers hook follows that layout, "
+                        "as on 0.5.21)" % tag)
+        check("fused" not in text, "%s: no fused K/V branch the hook would plan against" % tag)
+    cb = find(pool, "MHATokenToKVPool._create_buffers")
+    check("self._create_buffers_normal()" in ast.unparse(cb) and "self.is_quantized_kv_cache" in ast.unparse(cb)
+          and "self.post_capture_active" in ast.unparse(cb),
+          "%s: _create_buffers dispatches on is_quantized_kv_cache and post_capture_active" % tag)
+    init = find(pool, "MHATokenToKVPool.__init__")
+    check({"head_num", "head_dim", "v_head_dim", "kv_cache_layout", "use_hnd"} <= stores(init)
+          and "self._create_buffers" in calls(init),
+          "%s: MHATokenToKVPool sets the layout in __init__ and builds its buffers there" % tag)
+    need = {"size", "page_size", "device", "store_dtype", "layer_num", "enable_custom_mem_pool"}
+    have = stores(find(pool, "KVCache.__init__"))
+    check(need <= have, "%s: KVCache sets what the plugin reads; missing: %r" % (tag, need - have))
+
+    # the helpers the plugin imports, and where the cap lives
+    check(find(parse("sglang.srt.configs.model_config"), "is_deepseek_v4") is not None, "%s: is_deepseek_v4" % tag)
+    check("current_platform" in names(parse("sglang.srt.platforms")),
+          "%s: sglang.srt.platforms.current_platform" % tag)
+    check(any(isinstance(n, ast.FunctionDef) and n.name == "get_schedule"
+              for n in parse("sglang.srt.runtime_context").body), "%s: runtime_context.get_schedule" % tag)
+    check({"get_world_group"} <= {f.name for f in parse("sglang.srt.distributed.parallel_state").body
+                                  if isinstance(f, ast.FunctionDef)}, "%s: parallel_state.get_world_group" % tag)
+
+
+CASES = [case_entry_point, case_settings, case_kv, case_kv23, case_cap, case_cap23, case_kv_other_pool,
+         case_kv_miss, case_s2_23, case_blocked, case_hnd, case_page_major, case_minimax_sparse, case_post_capture,
+         case_unequal_head_dims, case_weights, case_weights_and_kv, case_fail_open, case_drift, case_ranks,
+         case_upstream]
+CASES.insert(CASES.index(case_cap23), case_kv21)
 
 
 def main():
-    global SGLANG_SRC
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default="build/host")
-    ap.add_argument("--sglang-src", required=True)
+    ap.add_argument("--sglang-src", action="append", default=[])
     a = ap.parse_args()
-    SGLANG_SRC = os.path.abspath(a.sglang_src)
-    if not os.path.isfile(os.path.join(SGLANG_SRC, "python", "sglang", "srt", "plugins", "hook_registry.py")):
-        print("test_sglang_plugin: %s is not an SGLang source tree" % SGLANG_SRC)
-        return 2
+    SGLANG_SRCS.extend(os.path.abspath(s) for s in a.sglang_src if os.path.isdir(s))
+    if not SGLANG_SRCS:
+        # An export tree carries no upstream cache; the Makefile passes $(SGLANG_UPSTREAM), which is
+        # empty there. That is not drift: case_upstream skips itself, and every other case runs on the
+        # stand-in tree alone (plugins_files() gives it the pocket plugin loader and hook registry).
+        print("test_sglang_plugin: no --sglang-src tree given: case_upstream is skipped")
+    for src in SGLANG_SRCS:
+        if not os.path.isfile(os.path.join(src, "python", "sglang", "srt", "plugins", "hook_registry.py")):
+            print("test_sglang_plugin: %s is not an SGLang source tree" % src)
+            return 2
     bindir = os.path.abspath(a.bin)
     os.environ["SPARK_ATTIC_LIBCUDA"] = os.path.join(bindir, "fakecuda", "libcuda.so.1")
     sys.modules["torch"] = TORCH

@@ -53,10 +53,11 @@ class Tensor:
     """Bytes in host memory (torch.zeros: "buf", counted as allocated while alive) or at a fake-CUDA address
     (torch.as_tensor on an array interface: "va")."""
 
-    def __init__(self, kind, nbytes, dtype, shape=None, buf=None, va=None, owner=None, base=None):
+    def __init__(self, kind, nbytes, dtype, shape=None, buf=None, va=None, owner=None, base=None, offset=0):
         self.kind, self.nbytes, self.dtype, self.buf, self.va, self.owner = kind, nbytes, dtype, buf, va, owner
         self.shape = tuple(shape) if shape is not None else (nbytes // dtype.itemsize,)
         self.base = base  # a view keeps its source alive
+        self.offset = offset  # a view's byte offset into its source (buf[0, :rows] and friends)
         self.is_cuda = True
 
     def numel(self):
@@ -72,7 +73,24 @@ class Tensor:
         return True
 
     def data_ptr(self):
-        return self.va if self.kind == "va" else ctypes.addressof(self.buf)
+        at = self.va if self.kind == "va" else ctypes.addressof(self.buf)
+        return at + self.offset
+
+    def __getitem__(self, idx):
+        """What a fused KV pool does to its buffer: buf[i, :rows] (and a flat slice) — a view."""
+        if isinstance(idx, slice):
+            idx = (0, idx)
+        first, rest = idx
+        assert isinstance(first, int) and isinstance(rest, slice) and rest.step is None
+        inner = self.nbytes // self.shape[0]  # bytes per first-dim element
+        elem = inner // self.shape[1] if len(self.shape) > 1 else inner  # bytes per second-dim element
+        start = rest.start or 0
+        last = self.shape[1] if len(self.shape) > 1 else self.shape[0]
+        stop = rest.stop if rest.stop is not None else last
+        assert 0 <= start <= stop <= last
+        return Tensor(self.kind, (stop - start) * elem, self.dtype, shape=(stop - start,) + self.shape[2:],
+                      buf=self.buf, va=self.va, owner=self.owner, base=self.base or self,
+                      offset=self.offset + first * inner + start * elem)
 
     def view(self, x):
         src = self.base or self
@@ -85,14 +103,15 @@ class Tensor:
         return t
 
     def raw(self):
-        return bytes(self.buf) if self.kind == "buf" else _cuda.read(0, self.va, self.nbytes)
+        return bytes(ctypes.string_at(self.data_ptr(), self.nbytes)) if self.kind == "buf" \
+            else _cuda.read(0, self.data_ptr(), self.nbytes)
 
     def put(self, data):
         assert len(data) == self.nbytes
         if self.kind == "buf":
-            ctypes.memmove(self.buf, data, len(data))
+            ctypes.memmove(ctypes.c_void_p(self.data_ptr()), data, len(data))
         else:
-            _cuda.write(0, self.va, data)
+            _cuda.write(0, self.data_ptr(), data)
 
     def copy_(self, src):
         self.put(src.raw())
