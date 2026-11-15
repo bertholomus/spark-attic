@@ -125,7 +125,7 @@ mkartifact() { # $1 = artifact dir, $2 = version: what build-release.sh lays dow
 validate_env() {
   local R=$1
   echo "ATTIC_CHECK_ARGS=--meminfo $R/meminfo --iomem $R/iomem"
-  echo "ATTIC_DAEMON_ARGS=--meminfo $R/meminfo --iomem $R/iomem"
+  echo "ATTIC_DAEMON_ARGS=--meminfo $R/meminfo --iomem $R/iomem --drm-dir $R/sys/class/drm"
   echo "LD_LIBRARY_PATH=$BIN/fakecuda"
   echo "ATTIC_FAKE_REGION=0x280000000:0x8000000"
   echo "ATTIC_FAKE_HELD=0"
@@ -142,7 +142,7 @@ instenv() { # $1 = fake root: the environment one install run needs
   export ATTIC_OTHER_SOCKETS="$R/other-lender.sock"
   export ATTIC_PROBE_ARGS="--modeset-dir $R/proc --drm-dir $R/sys/class/drm --pmon-file $R/absent-pmon"
   export ATTIC_CHECK_ARGS="--meminfo $R/meminfo --iomem $R/iomem"
-  export ATTIC_DAEMON_ARGS="--meminfo $R/meminfo --iomem $R/iomem"
+  export ATTIC_DAEMON_ARGS="--meminfo $R/meminfo --iomem $R/iomem --drm-dir $R/sys/class/drm"  # never the host's display state (a CI runner has one)
   export LD_LIBRARY_PATH="$BIN/fakecuda"
   export ATTIC_FAKE_REGION="0x280000000:0x8000000" ATTIC_FAKE_HELD="0" ATTIC_HUP="true"
   export ATTIC_MODES=heap

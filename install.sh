@@ -726,7 +726,7 @@ FAKE
   export ATTIC_OTHER_SOCKETS="$r/other-lender.sock"
   export ATTIC_TEST=1
   export ATTIC_CHECK_ARGS="--meminfo $r/meminfo --iomem $r/iomem"
-  export ATTIC_DAEMON_ARGS="--meminfo $r/meminfo --iomem $r/iomem"
+  export ATTIC_DAEMON_ARGS="--meminfo $r/meminfo --iomem $r/iomem --drm-dir $r/sys/class/drm"
   export LD_LIBRARY_PATH="$HERE/build/host/fakecuda"
   export ATTIC_FAKE_REGION="0x280000000:0x8000000" ATTIC_FAKE_HELD="0" ATTIC_HUP="true"
   export ATTIC_MODES=heap

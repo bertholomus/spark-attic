@@ -79,7 +79,10 @@ class Node:
         self.env = dict(os.environ, ATTIC_TEST="1", ATTIC_BIN=bindir, ATTIC_LIB=self.lib, ATTIC_RUN=self.run,
                         ATTIC_VERSION_FILE=self.version, ATTIC_OTHER_SOCKETS=os.path.join(self.dir, "other.sock"),
                         ATTIC_CHECK_ARGS="--meminfo %s/meminfo --iomem %s/iomem" % (self.dir, self.dir),
-                        ATTIC_DAEMON_ARGS="--meminfo %s/meminfo --iomem %s/iomem" % (self.dir, self.dir),
+                        # the candidate atticd reads an empty DRM tree, not the host's: a CI runner has a virtual
+                        # display connected, and atticd rightly lends nothing there
+                        ATTIC_DAEMON_ARGS="--meminfo %s/meminfo --iomem %s/iomem --drm-dir %s/drm-none"
+                                          % (self.dir, self.dir, self.dir),
                         LD_LIBRARY_PATH=os.path.join(bindir, "fakecuda"),
                         ATTIC_FAKE_REGION="0x280000000:0x8000000", ATTIC_FAKE_HELD="0", ATTIC_HUP="true",
                         ATTIC_KEY_FILE=self.keyfile)
@@ -99,7 +102,7 @@ class Node:
                                       *(key or ("--key-file", self.keyfile)),
                                       "--artifacts", os.path.join(self.lib, "artifacts"), "--version-file", self.version,
                                       "--meminfo", os.path.join(self.dir, "meminfo"), "--iomem",
-                                      os.path.join(self.dir, "iomem")],
+                                      os.path.join(self.dir, "iomem"), "--drm-dir", os.path.join(self.dir, "drm-none")],
                                      env=self.env, stderr=open(os.path.join(self.dir, "prod.log"), "a"))
         for _ in range(100):
             if os.path.exists(sock):
