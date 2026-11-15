@@ -125,9 +125,12 @@ class Rig:
         return d
 
     def args(self, *extra):
+        # A test daemon never reads the host's own display state: a CI runner has a virtual display connected
+        # (card1-Virtual-1), and atticd rightly refuses to lend there. The display-guard cases pass their own
+        # --drm-dir after this one, and the last one given wins.
         return [os.path.join(self.bin, "atticd"), "--socket", self.sock, "--key", KEY, "--artifacts", self.art,
                 "--version-file", self.version, "--iomem", self.iomem, "--meminfo", self.meminfo,
-                "--state", self.ledger, *extra]
+                "--state", self.ledger, "--drm-dir", os.path.join(self.dir, "drm-none"), *extra]
 
     def start(self, *extra, env=None):
         e = dict(os.environ)
@@ -958,19 +961,27 @@ def case_display_beyond_budget(rig):
     and bring-up - walk the whole tree, not just the budget the tick keeps. Before the fix both read only the
     first 256 entries, miss the holder and call the display idle: --probe-display prints an idle modeset-holder
     and bring-up lends over a desktop that is up (pmon reads idle, the holder is not a type G process)."""
-    tree = modeset_holders(rig, {300: ("/usr/lib/xorg/Xorg :0", True)}, fill=260)
+    # readdir order is the filesystem's (creation order on some, name-hash order on ext4, as on CI runners), so
+    # build the fillers first and make the holder of whichever entry the directory lists last.
+    tree = modeset_holders(rig, {}, fill=260)
     order = os.listdir(tree)
-    check(len(order) > 256 and order.index("300") > 256,
-          "the fake tree is real-sized: %d entries, the holder at %d" % (len(order), order.index("300")))
+    late = order[-1]
+    os.makedirs(os.path.join(tree, late, "fd"), exist_ok=True)
+    with open(os.path.join(tree, late, "cmdline"), "wb") as f:
+        f.write(b"/usr/lib/xorg/Xorg\x00:0")
+    os.symlink("/dev/nvidia-modeset", os.path.join(tree, late, "fd", "3"))
+    order = os.listdir(tree)
+    check(len(order) > 256 and order.index(late) > 256,
+          "the fake tree is real-sized: %d entries, the holder at %d" % (len(order), order.index(late)))
     idle = pmon_file(rig, [])
     p = subprocess.run(rig.args("--probe-display", "--modeset-dir", tree, "--pmon-file", idle,
                                 "--drm-dir", os.path.join(rig.dir, "drm-none")), capture_output=True, text=True)
     lines = p.stdout.splitlines()
-    check(p.returncode == 1 and lines and lines[0].startswith("IN-USE modeset-holder") and "pid 300" in lines[0],
+    check(p.returncode == 1 and lines and lines[0].startswith("IN-USE modeset-holder") and ("pid %s" % late) in lines[0],
           "--probe-display reads the whole tree: the holder past entry 256 is found: %r" % lines)
     rig.start("--modeset-dir", tree, "--pmon-file", idle, "--drm-dir", os.path.join(rig.dir, "drm-none"))
     st = ask(rig.sock, '{"key":"%s","op":"status"}' % KEY)
-    check(st["state"] == "refusing" and "pid 300" in st["why"],
+    check(st["state"] == "refusing" and ("pid %s" % late) in st["why"],
           "bring-up reads the whole tree too: refusing, why names the holder (%r)" % st["why"])
     rig.stop()
 
