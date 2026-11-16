@@ -6,7 +6,10 @@
  * process, cuMemCreate maps anonymous shared memory, and copies and memsets go to and from those mappings (across
  * neighbouring mappings, as in one reserved range). A handle's memory lives until it is released and no longer mapped.
  * ATTIC_FAKECUDA_CORRUPT=1 flips one bit on every read back (attic-check must then fail); ATTIC_FAKECUDA_NOIMPORT=1
- * refuses every import; ATTIC_FAKECUDA_NOCREATE=1 refuses every cuMemCreate.
+ * refuses every import; ATTIC_FAKECUDA_NOCREATE=1 refuses every cuMemCreate; ATTIC_FAKECUDA_BADGETRANGE=1 makes
+ * cuMemGetAddressRange answer a range that does not match the mapping; ATTIC_FAKECUDA_HOSTMEMTYPE=1 makes
+ * cuPointerGetAttribute(MEMORY_TYPE) call a mapped slice host memory (both play the compat-driver lies attic-check's
+ * compat phase exists to catch).
  */
 #define _GNU_SOURCE
 #include <stdint.h>
@@ -229,6 +232,22 @@ int cuMemcpyDtoH_v2(void *dst, unsigned long long src, size_t n)
     return 0;
 }
 
+int cuMemcpyDtoD_v2(unsigned long long dst, unsigned long long src, size_t n)
+{
+    while (n) {
+        size_t run;
+        const uint8_t *s = at(src, n, &run);
+        if (s == NULL)
+            return FAKE_ERROR;
+        uint8_t *d = at(dst, run, &run);
+        if (d == NULL)
+            return FAKE_ERROR;
+        memmove(d, s, run); /* the bench never overlaps; memmove covers the general case anyway */
+        dst += run, src += run, n -= run;
+    }
+    return 0;
+}
+
 int cuMemsetD8_v2(unsigned long long dst, unsigned char v, size_t n)
 {
     while (n) {
@@ -270,4 +289,39 @@ int cuMemRelease(unsigned long long handle)
     h->released = 1;
     drop(h);
     return 0;
+}
+
+int cuDriverGetVersion(int *version)
+{
+    *version = 12080;
+    return 0;
+}
+
+/* cuMemGetAddressRange_v2 semantics: the va range that holds d. ATTIC_FAKECUDA_BADGETRANGE plays the compat-driver
+ * lie Owen warned about (a range that does not match the mapping). */
+int cuMemGetAddressRange(unsigned long long *base, size_t *size, unsigned long long d)
+{
+    for (int i = 0; i < MAX_MAPS; i++)
+        if (maps[i].h && d >= maps[i].va && d < maps[i].va + maps[i].size) {
+            *base = maps[i].va;
+            *size = maps[i].size;
+            if (getenv("ATTIC_FAKECUDA_BADGETRANGE"))
+                *base = d - (2u << 20);
+            return 0;
+        }
+    return FAKE_ERROR;
+}
+
+/* Only what attic-check asks: the memory type at d. ATTIC_FAKECUDA_HOSTMEMTYPE plays the other compat lie (the
+ * lent slice reported as host memory). */
+int cuPointerGetAttribute(void *data, int attribute, unsigned long long d)
+{
+    if (attribute != 2) /* CU_POINTER_ATTRIBUTE_MEMORY_TYPE */
+        return FAKE_ERROR;
+    for (int i = 0; i < MAX_MAPS; i++)
+        if (maps[i].h && d >= maps[i].va && d < maps[i].va + maps[i].size) {
+            *(unsigned *)data = getenv("ATTIC_FAKECUDA_HOSTMEMTYPE") ? 1u : 2u; /* CU_MEMORYTYPE_HOST : DEVICE */
+            return 0;
+        }
+    return FAKE_ERROR;
 }

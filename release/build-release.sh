@@ -81,6 +81,7 @@ sed "s/^VERSION=\${INSTALL_VERSION:-[0-9.]*/VERSION=\${INSTALL_VERSION:-$V/" "$H
   >"$STAGE/install.sh"
 chmod 755 "$STAGE/install.sh"
 cp "$HERE/scripts/attic-validate.sh" "$STAGE/scripts/"
+cp "$HERE/scripts/node-trim.sh" "$STAGE/scripts/"
 cp "$HERE/systemd/attic.service" "$STAGE/systemd/"
 cp "$HERE/sysctl/99-spark-attic-minfree.conf" "$STAGE/sysctl/"
 cp -r "$HERE/python/." "$STAGE/python/"
@@ -92,7 +93,7 @@ for _di in "$STAGE"/python/spark_attic-[0-9]*.dist-info; do
 done
 sed -i "s/^Version: .*/Version: $V/" "$STAGE/python/spark_attic-$V.dist-info/METADATA"
 # the docs: the working tree keeps them under release/, the exported tree at its root
-for f in README.md INSTALL.md RELEASE-NOTES-0.1.2.md; do
+for f in README.md INSTALL.md RELEASE-NOTES-0.1.3.md; do
   src=$HERE/release/$f
   [ -f "$src" ] || src=$HERE/$f
   [ -f "$src" ] && cp "$src" "$STAGE/share/spark-attic/$f"

@@ -13,7 +13,7 @@
                                         and the logs unless --purge
     spark-attic demo [--fail STEP]      the install story on a fake node: what a first run
                                         shows, one refusal path with --fail
-    spark-attic version                 one line: spark-attic 0.1.2
+    spark-attic version                 one line: spark-attic 0.1.3
 
 Every path honours --root DIR (a fake root for the host tests). Colour and the brand header
 appear only on a colour TTY: piped output, NO_COLOR, TERM=dumb, ATTIC_COLOR=never or --plain
@@ -31,7 +31,7 @@ import sys
 import tempfile
 import time
 
-APP_VERSION = "0.1.2"  # build-release.sh stamps this to the release version
+APP_VERSION = "0.1.3"  # build-release.sh stamps this to the release version
 NAME = "spark-attic"
 
 # The icon kit's terminal colours: the frames and letters take the paper colour, the L nose the

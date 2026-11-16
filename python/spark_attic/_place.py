@@ -121,10 +121,12 @@ class Placement:
     place: tuple = ("kv",)          # where the carveout goes: "kv", "weights", or both (weights first)
     weights: tuple = ("embed_tokens",)  # for "weights": parameter names or globs
     cap: int = 0                    # at most this many bytes of carveout; 0 for all atticd has free
+    head: bool = False              # kv at the head of the pool (SPARK_ATTIC_KV_HEAD): KV block 0 in the carveout
 
     @classmethod
     def from_env(cls, env, default="kv"):
-        """SPARK_ATTIC_PLACE (kv, weights, weights,kv or off), SPARK_ATTIC_WEIGHTS, SPARK_ATTIC_MIB."""
+        """SPARK_ATTIC_PLACE (kv, weights, weights,kv or off), SPARK_ATTIC_WEIGHTS, SPARK_ATTIC_MIB,
+        SPARK_ATTIC_KV_HEAD."""
         raw = (env.get("SPARK_ATTIC_PLACE") or default).replace(" ", "").lower()
         if raw in ("off", "none", "0"):
             return cls(place=())
@@ -137,7 +139,11 @@ class Placement:
         cap = env.get("SPARK_ATTIC_MIB") or "0"
         if not cap.isdigit():
             raise ValueError("SPARK_ATTIC_MIB=%s is not a whole number of MiB" % cap)
-        return cls(place=tuple(p for p in PLACES if p in place), weights=weights, cap=int(cap) * MIB)
+        hraw = (env.get("SPARK_ATTIC_KV_HEAD") or "").strip().lower()
+        if hraw and hraw not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+            raise ValueError("SPARK_ATTIC_KV_HEAD=%s: use 1 or 0" % hraw)
+        return cls(place=tuple(p for p in PLACES if p in place), weights=weights, cap=int(cap) * MIB,
+                   head=hraw in ("1", "true", "yes", "on"))
 
 
 def name_matches(name, patterns):
@@ -177,6 +183,37 @@ def tail_plan(sizes, attic):
         offsets.append(at)
         at += s
     return TailPlan(first=first, front=front, offsets=tuple(offsets), attic_used=min(attic, at - front))
+
+
+@dataclass(frozen=True)
+class HeadPlan:
+    """The head plan: buffers [0, last] go into one mapping, back to back at offsets[i]: the lent slice first, then
+    `front` bytes of device memory. Buffers after `last` stay where the framework puts them. KV block 0 and its
+    neighbours land in the carveout, so a run that touches only the first blocks reads carved pages."""
+    last: int
+    front: int
+    offsets: tuple
+    attic_used: int
+
+
+def head_plan(sizes, attic):
+    """The first buffers of sizes[] that fit in `attic` bytes (whole 2 MiB slices), whole, plus the one after them
+    split across what is left of the slice and device memory glued behind it — tail_plan's mirror image. Same 2 MiB
+    boundary rule."""
+    aligned = [round_up(s, SLICE) for s in sizes]
+    head, k = 0, 0
+    while k < len(sizes) and head + aligned[k] <= attic:
+        head += aligned[k]
+        k += 1
+    last, front = k - 1, 0
+    if k < len(sizes) and attic > head:  # what is left of the slice goes to the start of the buffer after the head
+        last = k
+        front = aligned[k] - (attic - head)
+    offsets, at = [], 0
+    for s in aligned[:last + 1]:
+        offsets.append(at)
+        at += s
+    return HeadPlan(last=last, front=front, offsets=tuple(offsets), attic_used=min(attic, at))
 
 
 # ------------------------------------------------------------------------------------- what the hooks do at runtime
@@ -234,18 +271,21 @@ def model_of(holder):
     return model
 
 
-def move_params(model, patterns, pool, ledger, keep, dev):
+def move_params(model, patterns, pool, ledger, keep, dev, skip=frozenset()):
     """Move the parameters of `model` that `patterns` name (each tied parameter once) into the carveout, one slice
-    each, while the ledger has room. The mappings go to `keep`. Returns ([(name, slice bytes)], device bytes freed)."""
+    each, while the ledger has room. Parameter ids in `skip` are already in the carveout (place_params made their
+    storage) and pass by. The mappings go to `keep`. Returns ([(name, slice bytes)], device bytes freed)."""
     import gc
     import torch
 
     want, seen = [], set()
     for name, p in model.named_parameters(remove_duplicate=False):
-        if id(p) not in seen and name_matches(name, patterns):
+        if id(p) not in seen and id(p) not in skip and name_matches(name, patterns):
             seen.add(id(p))
             want.append((name, p))
     if not want:
+        if skip:
+            return [], 0
         log.warning("spark-attic: weights placement: no parameter matches %s", ",".join(patterns))
         return [], 0
     torch.cuda.synchronize(dev)
@@ -280,3 +320,60 @@ def move_params(model, patterns, pool, ledger, keep, dev):
     gc.collect()
     torch.cuda.empty_cache()
     return moved, max(before - torch.cuda.memory_allocated(dev), 0)
+
+
+def place_params(model, patterns, pool, ledger, keep):
+    """Give the parameters of `model` that `patterns` name (each tied parameter once) carveout storage BEFORE the
+    weights are loaded: one slice each while the ledger has room, the parameter's data repointed and nothing copied,
+    so load_weights fills the carveout and the weights never touch device memory. The mappings go to `keep`.
+    Returns [(name, parameter, slice bytes)]."""
+    want, seen = [], set()
+    for name, p in model.named_parameters(remove_duplicate=False):
+        if id(p) not in seen and name_matches(name, patterns):
+            seen.add(id(p))
+            want.append((name, p))
+    if not want:
+        log.warning("spark-attic: weights placement: no parameter matches %s", ",".join(patterns))
+        return []
+    placed = []
+    for name, p in want:
+        n = p.numel() * p.element_size()
+        need = round_up(n, SLICE)
+        if not p.is_contiguous():
+            log.warning("spark-attic: %s stays: not a contiguous parameter", name)
+            continue
+        room = ledger.room(pool)
+        if need > room:
+            log.warning("spark-attic: %s stays: it needs %d MiB, %d MiB of carveout is left", name, need // MIB,
+                        room // MIB)
+            continue
+        m = pool.map(0, [need])
+        try:
+            p.data = m.tensor(p.dtype, shape=tuple(p.shape), nbytes=n)
+        except Exception:
+            m.close()
+            raise
+        keep.append(m)
+        ledger.spend(need)
+        placed.append((name, p, need))
+    return placed
+
+
+def carved_params(model, preplaced):
+    """Which pre-placed parameters still hold the storage place_params gave them: ([(name, slice bytes)], skip ids).
+    A parameter whose data was swapped since (a weight postprocessor rewrites it) drops out of the registry and gets
+    moved like any other; entries the model no longer has are dropped too."""
+    kept, skip, walked = [], set(), set()
+    for _, p in model.named_parameters(remove_duplicate=False):
+        walked.add(id(p))
+        rec = preplaced.get(id(p))
+        if rec is None:
+            continue
+        if id(p.data) == rec[2]:
+            kept.append((rec[0], rec[1]))
+            skip.add(id(p))
+        else:
+            preplaced.pop(id(p))
+    for pid in [k for k in preplaced if k not in walked]:
+        preplaced.pop(pid)
+    return kept, frozenset(skip)

@@ -6,7 +6,7 @@
 CC ?= cc
 OUT ?= build/host
 # the one place the version is written; build-release.sh overrides it with its argument
-ATTIC_VERSION ?= 0.1.2
+ATTIC_VERSION ?= 0.1.3
 CFLAGS ?= -std=gnu11 -O2 -g -Wall -Wextra -Wformat=2 -Wno-format-nonliteral -fstack-protector-strong -D_FORTIFY_SOURCE=2
 CFLAGS += -DATTIC_VERSION_STR='"$(ATTIC_VERSION)"'
 # The release build maps the build tree's and the zig toolchain's paths out of the debug info:
@@ -56,6 +56,7 @@ check: all $(OUT)/test_units $(OUT)/fakecuda/libcuda.so.1
 	python3 -I tests/test_preflight.py
 	tests/test_install.sh --bin $(OUT)
 	python3 -I tests/test_cli.py
+	tests/test_node_trim.sh
 
 $(OUT):
 	mkdir -p $@

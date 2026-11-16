@@ -37,6 +37,7 @@ anything else.
 | `draining_mib` | integer | MiB clients gave back that the driver has not yet returned (a process still maps it). |
 | `clients` | integer | Clients connected now. |
 | `every_s` | integer | The rewrite period in seconds (`--status-every`). |
+| `pages` | string | What page size RM granted the heap's memory: `"2MB pages"` when RM took the 2 MiB GPU page request, `"default pages"` after it refused them (the shim falls back to RM's default for every later block), `""` while atticd is not up. |
 | `pid` | integer | atticd's process id. |
 | `updated` | integer | When this file was written, Unix seconds (the node's clock). |
 
@@ -46,7 +47,7 @@ lent_mib + draining_mib` is never more than `size_mib`.
 Example (an ASUS Ascent GX10, driver 580.178.04, one vLLM server holding the whole carveout as KV cache):
 
 ```
-{"name":"spark-attic","version":"0.1.0","state":"ready","why":"","driver":"580.178.04","mode":"heap","validated":true,"validated_at":"2026-11-02T23:55:01Z","size_mib":2044,"free_mib":0,"largest_mib":0,"lent_mib":2044,"draining_mib":0,"clients":1,"every_s":10,"pid":2208001,"updated":1793663870}
+{"name":"spark-attic","version":"0.1.0","state":"ready","why":"","driver":"580.178.04","mode":"heap","validated":true,"validated_at":"2026-11-02T23:55:01Z","size_mib":2044,"free_mib":0,"largest_mib":0,"lent_mib":2044,"draining_mib":0,"clients":1,"every_s":10,"pages":"2MB pages","pid":2208001,"updated":1793663870}
 ```
 
 ## Reading it

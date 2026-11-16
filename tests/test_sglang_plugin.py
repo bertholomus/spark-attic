@@ -227,6 +227,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def load_model(self):
         self.weight_bytes = sum(p.numel() * p.element_size() for _, p in self.model.named_parameters())
 '''
+LOADER_SRC = '''
+def _initialize_model(model_config, load_config, quant_config=None):
+    """As SGLang 0.5.14 and 0.5.23: builds the model and returns it."""
+    return model_config["model"]
+'''
 POOL = '''from contextlib import nullcontext
 
 import torch
@@ -996,6 +1001,50 @@ def case_weights(rig):
     wait_free(rig.sock, 62 * MIB)
 
 
+def case_preplace(rig):
+    """weights: the loader's _initialize_model gives the parameters carveout storage BEFORE load_weights fills them,
+    so SGLang's own free-memory measurement never sees those weights in device memory."""
+    rig.start(env=SMALL)
+    files = dict(tree())
+    files["sglang/srt/model_loader/__init__.py"] = PKG
+    files["sglang/srt/model_loader/loader.py"] = LOADER_SRC
+    files["sglang/srt/model_executor/model_runner.py"] = RUNNER.replace(
+        "    def load_model(self):\n"
+        "        self.weight_bytes = sum(p.numel() * p.element_size() for _, p in self.model.named_parameters())\n",
+        "    def load_model(self):\n"
+        "        from sglang.srt.model_loader.loader import _initialize_model\n"
+        "        self.model = _initialize_model({\"model\": self.model}, None)\n"
+        "        for _, p in self.model.named_parameters(remove_duplicate=False):\n"
+        "            p.data.put(b\"\\x07\" * p.numel() * p.element_size())\n"
+        "        self.weight_bytes = sum(p.numel() * p.element_size() for _, p in self.model.named_parameters())\n")
+    v = Sgl(env_for(rig, PLACE="weights"), files=files)
+    try:
+        loader_mod = importlib.import_module("sglang.srt.model_loader.loader")
+        check(getattr(loader_mod._initialize_model, "__spark_attic__", False), "_initialize_model wrapped")
+        nb = 1281 * 2048 * 2
+        embed = TORCH.param(nb, TORCH.float16, (1281, 2048), 3)
+        other = TORCH.param(MIB, TORCH.bfloat16, (512, 1024), 9)
+        r = v.runner(model=Model([("model.embed_tokens.weight", embed), ("model.layers.0.w", other),
+                                  ("lm_head.weight", embed)]))
+        r.load_model()
+        check(embed.data.kind == "va" and embed.data.shape == (1281, 2048) and embed.data.dtype is TORCH.float16,
+              "embed_tokens lives in the carveout from model construction: %s" % embed.data.kind)
+        check(embed.data.raw() == b"\x07" * nb, "the weights filled the carveout: 0x07 * %d" % nb)
+        check(other.data.kind == "buf", "unmatched weights stay")
+        check(len(sglang_plugin.S.keep) == 1 and lent(rig) == 6 * MIB, "one 6 MiB slice, spent once")
+        check(LOGS.has("get their carveout storage before load_weights") and LOGS.has("fill it directly"),
+              "the pre-place says so in one line")
+        check(LOGS.has("already in the carveout from model construction")
+              and not LOGS.has("moved to the display carveout"), "the load hook passes them by")
+        r.init_memory_pool(0)
+        check(r.max_total_num_tokens == (100 * MIB + nb) // 16384 // 16 * 16,
+              "SGLang measures after the load, so the pool grows by what never landed: %d tokens"
+              % r.max_total_num_tokens)
+    finally:
+        v.done()
+    wait_free(rig.sock, 62 * MIB)
+
+
 def case_weights_and_kv(rig):
     rig.start(env=SMALL)
     v = Sgl(env_for(rig, PLACE="weights,kv", MIB="40", WEIGHTS="lm_head,embed_tokens"))
@@ -1481,8 +1530,8 @@ def _upstream_0523(src, h, tag):
 
 CASES = [case_entry_point, case_settings, case_kv, case_kv23, case_cap, case_cap23, case_kv_other_pool,
          case_kv_miss, case_s2_23, case_blocked, case_hnd, case_page_major, case_minimax_sparse, case_post_capture,
-         case_unequal_head_dims, case_weights, case_weights_and_kv, case_fail_open, case_drift, case_ranks,
-         case_upstream]
+         case_unequal_head_dims, case_weights, case_preplace, case_weights_and_kv, case_fail_open, case_drift,
+         case_ranks, case_upstream]
 CASES.insert(CASES.index(case_cap23), case_kv21)
 
 

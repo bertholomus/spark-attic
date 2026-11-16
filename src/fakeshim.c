@@ -13,7 +13,9 @@
  * tests of the heap's recovery): ATTIC_FAKE_STARTSHORT=N marks every slice but one taken at open for N seconds, so
  * atticd starts on a heap of one 2 MiB block that returns to whole later; ATTIC_FAKE_LATE=N starts N seconds at the
  * first released block that comes free, so a client that dies leaves its slices in the heap for N seconds and the
- * heap returns to whole after them. The clock is CLOCK_MONOTONIC; no thread runs.
+ * heap returns to whole after them. ATTIC_FAKE_NO_HUGE=1 models RM refusing 2 MiB GPU pages, so the heap is asked
+ * for RM's default page size instead, exactly as rmshim.c falls back, and detail() names what was granted.
+ * The clock is CLOCK_MONOTONIC; no thread runs.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -57,6 +59,8 @@ struct attic_rm {
     time_t late_until;      /* ATTIC_FAKE_LATE: while now < this, released blocks stay taken */
     time_t short_until;     /* ATTIC_FAKE_STARTSHORT: while now < this, the slices below stay taken */
     uint64_t short_from, short_to; /* the slice range that window marked (short_to excluded) */
+    const char *pages;      /* what page size the last successful heap block was granted */
+    int no_huge;            /* RM (modeled) refused 2 MiB pages: its default since */
 };
 
 /* Seconds on CLOCK_MONOTONIC (the windows must not move when the wall clock moves). */
@@ -125,6 +129,7 @@ static int fake_open(struct attic_rm **out, int minor, char *err, size_t n)
         free(rm);
         return -ENOMEM;
     }
+    rm->pages = "none yet"; /* rmshim.c's word before its first successful heap block */
     for (int i = 0; i < 8; i++)
         rm->park[i].fd = -1;
     for (uint64_t i = 0; i < held / SLICE && i < rm->size / SLICE; i++)
@@ -286,6 +291,12 @@ static int fake_heap(struct attic_rm *rm, uint64_t size, uint32_t *handle, char 
     }
     short_lift(rm);
     collect(rm);
+    /* rmshim.c asks RM for 2 MiB GPU pages first and falls back to RM's default when it refuses them; the same
+     * two attempts here, ATTIC_FAKE_NO_HUGE playing RM's refusal, so the tests can walk both outcomes. The name
+     * is only set once a block is actually granted, as rmshim.c does. */
+    if (!rm->no_huge)
+        rm->no_huge = getenv("ATTIC_FAKE_NO_HUGE") != NULL;
+    const char *pages = rm->no_huge ? "default pages" : "2MB pages";
     int k = new_handle(rm, handle, err, n);
     if (k < 0)
         return -ENOSPC;
@@ -298,12 +309,14 @@ static int fake_heap(struct attic_rm *rm, uint64_t size, uint32_t *handle, char 
             memset(rm->taken + i, 1, want);
             rm->h[k] = (struct block){1, 0, 0, 0, unpark(rm, i, want), i, want, size, ""};
             snprintf(rm->h[k].name, sizeof rm->h[k].name, "attic-fake-%d-%08x", (int)getpid(), *handle);
+            rm->pages = pages;
             return 0;
         }
         i += j;
     }
     if (getenv("ATTIC_FAKE_RAM")) {
         rm->h[k] = (struct block){1, 1, 0, 0, -1, 0, 0, size, ""};
+        rm->pages = pages;
         return 0;
     }
     say(err, n, "fake: NV_ERR_NO_MEMORY");
@@ -430,8 +443,7 @@ static int fake_release(struct attic_rm *rm, uint32_t handle, char *err, size_t 
 
 static const char *fake_detail(struct attic_rm *rm)
 {
-    (void)rm;
-    return "fake pages";
+    return rm->pages;
 }
 
 static const struct attic_shim shim = {

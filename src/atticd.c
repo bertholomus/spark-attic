@@ -52,7 +52,7 @@
 
 /* the version comes from the Makefile (ATTIC_VERSION); the fallback keeps a bare cc build honest */
 #ifndef ATTIC_VERSION_STR
-#define ATTIC_VERSION_STR "0.1.2"
+#define ATTIC_VERSION_STR "0.1.3"
 #endif
 #define ATTICD_VERSION ATTIC_VERSION_STR
 #define TICK_S 2
@@ -1049,8 +1049,8 @@ static int op_info(struct client *c)
     char body[ATTIC_REPLY_MAX];
     reap();
     sizes(&size, &freeb, &largest, &lent, &draining);
-    int k = snprintf(body, sizeof body, "{\"ok\":true,\"size\":%" PRIu64 ",\"free\":%" PRIu64 ",\"largest\":%" PRIu64,
-                     size, freeb, largest);
+    int k = snprintf(body, sizeof body, "{\"ok\":true,\"size\":%" PRIu64 ",\"free\":%" PRIu64 ",\"largest\":%" PRIu64
+                     ",\"pages\":\"%s\"", size, freeb, largest, st.up ? st.shim->detail(st.rm) : "");
     if (!heap_mode() && c->uid == 0) /* the physical base only to root */
         k += snprintf(body + k, sizeof body - k, ",\"base\":%" PRIu64, st.ledger.base);
     snprintf(body + k, sizeof body - k, "}");
@@ -1111,10 +1111,10 @@ static void publish(void)
              "{\"name\":\"spark-attic\",\"version\":\"" ATTICD_VERSION "\",\"state\":\"%s\",\"why\":\"%s\","
              "\"driver\":\"%s\",\"mode\":\"%s\",\"validated\":%s,\"validated_at\":\"%s\",\"size_mib\":%llu,"
              "\"free_mib\":%llu,\"largest_mib\":%llu,\"lent_mib\":%llu,\"draining_mib\":%llu,\"clients\":%d,"
-             "\"every_s\":%d",
+             "\"every_s\":%d,\"pages\":\"%s\"",
              st.ready ? "ready" : "refusing", why, st.driver, cfg.mode, st.validated ? "true" : "false",
              checked, MiB(size), MiB(freeb), MiB(largest), MiB(lent), MiB(draining),
-             st.nclients, cfg.status_every);
+             st.nclients, cfg.status_every, st.up ? st.shim->detail(st.rm) : "");
     time_t now = time(NULL);
     if (strcmp(body, pub.last) == 0 && now - pub.written < cfg.status_every)
         return;

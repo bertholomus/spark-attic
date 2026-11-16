@@ -52,6 +52,7 @@ above the memory it measured, so the plugin gives the carveout back and raises i
 until the plugin is turned off (SPARK_ATTIC_PLACE=off).
 """
 import ast
+import functools
 import inspect
 import logging
 import os
@@ -61,12 +62,13 @@ import threading
 from contextlib import contextmanager
 
 from . import MIB, Pool, Settings
-from ._place import (Ledger, Mismatch, Placement, device_index, give_back, log_to_stderr, model_of, move_params,
-                     params, tail_plan)
+from ._place import (Ledger, Mismatch, Placement, carved_params, device_index, give_back, log_to_stderr, model_of,
+                     move_params, params, place_params, tail_plan, when_imported)
 
 log = logging.getLogger("spark_attic")
 GIB = 1 << 30
 
+LOADER = "sglang.srt.model_loader.loader"
 MHA = "sglang.srt.mem_cache.memory_pool.MHATokenToKVPool"
 RUNNER = "sglang.srt.model_executor.model_runner.ModelRunner"
 MIXIN = "sglang.srt.model_executor.model_runner_kv_cache_mixin.ModelRunnerKVCacheMixin"
@@ -85,6 +87,7 @@ TARGETS = {
         "pools": (MIXIN + "._init_pools", ["self"]),
         "buffers": (MHA + "._create_buffers", ["self"]),
         "load": (RUNNER + ".load_model", ["self"]),
+        "construct": (LOADER + "._initialize_model", ["model_config", "load_config", "quant_config"]),
     },
     "0.5.23": {
         "profile": (CONF + "._profile_available_bytes", ["self", "pre_model_load_memory"]),
@@ -92,6 +95,7 @@ TARGETS = {
         "pools": (CONF + "._init_pools", ["self", "sizes", "req_to_token_pool", "token_to_kv_pool_allocator"]),
         "buffers": (MHA + "._create_buffers", ["self"]),
         "load": (RUNNER + ".load_model", ["self"]),
+        "construct": (LOADER + "._initialize_model", ["model_config", "load_config", "quant_config"]),
     },
 }
 # What the cap hook calls, likewise.
@@ -123,6 +127,7 @@ class _State:
         self.layout = None        # how the pool's _create_buffers allocates: separate | fused
         self.hooked = set()       # TARGETS keys registered
         self.keep = []
+        self.preplaced = {}       # parameter id -> (name, slice bytes, data tensor id) the constructor was given
         self.lock = threading.RLock()
 
 
@@ -166,9 +171,29 @@ def register():
             else:
                 HookRegistry.register(TARGETS[S.shape or "0.5.14"]["load"][0], _load_hook, HookType.AROUND)
                 S.hooked.add("load")
+                when_imported(LOADER, _wrap_initialize)
     except Exception as e:
         S.placement = Placement(place=())
         log.warning("spark-attic: SGLang plugin off: %s: %s", type(e).__name__, e)
+
+
+def _wrap_initialize(mod):
+    """The model-construction wrap: failing open is safe, the weights load as SGLang would load them."""
+    target, want = TARGETS["0.5.23"]["construct"]
+    fn = getattr(mod, "_initialize_model", None)
+    if fn is None or getattr(fn, "__spark_attic__", False):
+        if fn is None:
+            log.warning("spark-attic: weights pre-placement off: %s has no _initialize_model" % target)
+        return
+    got = params(fn)
+    if got != want:
+        log.warning("spark-attic: weights pre-placement off: %s takes (%s); the plugin knows (%s)", target,
+                    ", ".join(got), ", ".join(want))
+        return
+    new = functools.wraps(fn)(_make_initialize(fn))
+    new.__spark_attic__ = True
+    setattr(mod, "_initialize_model", new)
+    S.hooked.add("construct")
 
 
 def _kv_shape(keys, calls):
@@ -619,11 +644,41 @@ def _same_device(device, dev):
 
 # -------------------------------------------------------------------------------------------------------- weights
 
+def _make_initialize(orig):
+    def _initialize_model(*args, **kwargs):
+        model = orig(*args, **kwargs)
+        try:
+            _preplace(model)
+        except Exception as e:
+            log.warning("spark-attic: weights stay in device memory (pre-place failed): %s: %s", type(e).__name__, e)
+        return model
+    return _initialize_model
+
+
+def _preplace(model):
+    """load_weights runs next: give the parameters SPARK_ATTIC_WEIGHTS names carveout storage first, so the weights
+    fill the carveout and never touch device memory. SGLang sizes its pools from the free memory it measures after
+    the load, so weights that live here never cost the model anything it counts."""
+    if "weights" not in S.placement.place or S.settings is None:
+        return
+    placed = place_params(model, S.placement.weights, _pool("cuda"), S.ledger, S.keep)
+    if not placed:
+        return
+    for name, p, need in placed:
+        S.preplaced[id(p)] = (name, need, id(p.data))
+    log.info("spark-attic: %s get their carveout storage before load_weights (%d MiB); the weights fill it directly",
+             ", ".join(n for n, _, _ in placed), sum(b for _, _, b in placed) // MIB)
+
+
 def _load_hook(original, self):
     out = original(self)
     try:
+        kept, skip = carved_params(model_of(self), S.preplaced)
+        if kept:
+            log.info("spark-attic: %s already in the carveout from model construction (%d MiB)",
+                     ", ".join(n for n, _ in kept), sum(b for _, b in kept) // MIB)
         moved, freed = move_params(model_of(self), S.placement.weights, _pool(self.device), S.ledger, S.keep,
-                                   device_index(self.device))
+                                   device_index(self.device), skip=skip)
         if moved:
             log.info("spark-attic: %s moved to the display carveout (%d MiB); %d MiB of device memory freed",
                      ", ".join(n for n, _ in moved), sum(b for _, b in moved) // MIB, freed // MIB)

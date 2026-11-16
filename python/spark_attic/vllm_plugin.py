@@ -7,6 +7,8 @@ fill the KV cache as their modules load, in the processes that load them.
     SPARK_ATTIC_PLACE    kv (default), weights, weights,kv, or off
     SPARK_ATTIC_WEIGHTS  for weights: parameter names or globs, comma-separated (default embed_tokens)
     SPARK_ATTIC_MIB      at most this many MiB of carveout (default: all atticd has free)
+    SPARK_ATTIC_KV_HEAD  1: the KV carveout takes the head of the pool (KV block 0 lands in it) instead of the tail;
+                         for benchmarking what the carveout costs the cache a short run actually touches (default 0)
     SPARK_ATTIC_LOG      0: no log handler of our own (default: our lines on stderr, logger spark_attic)
     and the client's SPARK_ATTIC_SOCK, SPARK_ATTIC_KEY or SPARK_ATTIC_KEY_FILE, SPARK_ATTIC_TIMEOUT_MS.
 
@@ -24,9 +26,11 @@ newest release tags):
 
 kv: Worker.determine_available_memory borrows the carveout and adds it to what vLLM measured (or to
 --kv-cache-memory-bytes, which then holds device memory), so vLLM sizes the KV pool larger by exactly that; the KV
-allocation then puts the tail of the cache in the carveout and the rest where vLLM puts them. weights: after
-Worker.load_model the named parameters move into the carveout, and vLLM's weight figure drops by what that freed, so
-vLLM's own profile gives the KV pool that much more. weights,kv: weights first, the rest to the KV pool.
+allocation then puts the tail of the cache in the carveout and the rest where vLLM puts them. weights: as the loader
+builds the model (before load_weights), the named parameters get their carveout storage right away and the weights
+fill it directly; parameters that miss the boat move into the carveout after Worker.load_model, and vLLM's weight
+figure drops by what that freed, so vLLM's own profile gives the KV pool that much more. weights,kv: weights first,
+the rest to the KV pool.
 
 Fail open until the budget is raised, loud after it: anything seen before determine_available_memory (a shape the
 plugin does not know, a mismatched signature, sleep mode, a KV connector, no atticd, nothing free) turns that
@@ -43,13 +47,14 @@ import sys
 import threading
 
 from . import MIB, Pool, Settings
-from ._place import (Ledger, Mismatch, Placement, device_index, give_back, log_to_stderr, model_of, move_params,
-                     params, tail_plan, when_imported)
+from ._place import (Ledger, Mismatch, Placement, carved_params, device_index, give_back, head_plan, log_to_stderr,
+                     model_of, move_params, params, place_params, tail_plan, when_imported)
 
 log = logging.getLogger("spark_attic")
 GIB = 1 << 30
 
 WORKER = "vllm.v1.worker.gpu_worker"
+LOADER_UTILS = "vllm.model_executor.model_loader.utils"
 RUNNER_V1 = "vllm.v1.worker.gpu_model_runner"
 RUNNER_V2 = "vllm.v1.worker.gpu.model_runner"
 ATTN_V2 = "vllm.v1.worker.gpu.attn_utils"
@@ -67,12 +72,14 @@ EXPECTED = {
     "0.24": {
         (WORKER, "Worker.determine_available_memory"): ["self"],
         (WORKER, "Worker.load_model"): ["self", "load_dummy_weights"],
+        (LOADER_UTILS, "initialize_model"): ["vllm_config", "prefix", "model_class", "model_config"],
         (RUNNER_V1, "GPUModelRunner._allocate_kv_cache_tensors"): ["self", "kv_cache_config"],
         (ATTN_V2, "_allocate_kv_cache"): ["kv_cache_config", "shared_layers", "device"],
     },
     "0.32": {
         (WORKER, "Worker.determine_available_memory"): ["self"],
         (WORKER, "Worker.load_model"): ["self", "load_dummy_weights"],
+        (LOADER_UTILS, "initialize_model"): ["vllm_config", "prefix", "model_class", "model_config"],
         (UTILS_V3, "allocate_kv_cache"): ["kv_cache_config", "device", "layout", "kernel_block_sizes"],
     },
 }
@@ -97,6 +104,7 @@ class _State:
         self.wrapped = set()      # the wrapped keys in this process
         self.errors = []          # why each wrap attempt did not wrap, for the placement's one line
         self.keep = []            # mappings that live as long as the worker
+        self.preplaced = {}       # parameter id -> (name, slice bytes, data tensor id) the constructor was given
         self.lock = threading.RLock()
 
 
@@ -120,6 +128,8 @@ def register():
                 return
             S.settings = Settings.from_env()
         when_imported(WORKER, _wrap_worker)
+        if "weights" in S.placement.place:
+            when_imported(LOADER_UTILS, _wrap_initialize)
         if "kv" in S.placement.place:
             when_imported(RUNNER_V1, _wrap_runner_v1)
             when_imported(ATTN_V2, _wrap_attn_v2)
@@ -196,6 +206,11 @@ def _wrap_runner_v1(mod):
         return
     _try_wrap(runner, "_allocate_kv_cache_tensors", (RUNNER_V1, "GPUModelRunner._allocate_kv_cache_tensors"),
               _make_alloc_v1)
+
+
+def _wrap_initialize(mod):
+    """The model-construction wrap: failing open is safe, the weights load as vLLM would load them."""
+    _try_wrap(mod, "initialize_model", (LOADER_UTILS, "initialize_model"), _make_initialize)
 
 
 def _wrap_attn_v2(mod):
@@ -385,34 +400,53 @@ def _kv_tensors(kv_cache_config, device, zeros):
                 packed[1].extend(t.shared_by)
             else:
                 backings.append([t.size, list(t.shared_by)])
-        plan = tail_plan([size for size, _ in backings], lent.size)
-        if plan.first == len(backings):
-            raise Mismatch("no KV tensors to place")
+        if S.placement.head:  # KV block 0 in the carveout: the head plan, device glue behind the slice
+            plan = head_plan([size for size, _ in backings], lent.size)
+            if plan.last < 0:
+                raise Mismatch("no KV tensors to place")
+            m = S.pool.map(plan.front, [lent], device_after=True)
+        else:
+            plan = tail_plan([size for size, _ in backings], lent.size)
+            if plan.first == len(backings):
+                raise Mismatch("no KV tensors to place")
+            m = S.pool.map(plan.front, [lent])
         if plan.attic_used < lent.size:
             log.info("spark-attic: the KV cache needs only %d of the %d MiB lent", plan.attic_used // MIB,
                      lent.size // MIB)
-        m = S.pool.map(plan.front, [lent])
     except Exception:
         _give_up(lent)
         raise
     try:
         m.zero()  # vLLM's own KV tensors start zeroed
         out = {}
-        for i, (size, names) in enumerate(backings):
-            if i < plan.first:
-                t = zeros(size)
-            else:
-                t = m.tensor(torch.int8, offset=plan.offsets[i - plan.first], nbytes=size)
-            for name in names:
-                out[name] = t
+        if S.placement.head:
+            for i, (size, names) in enumerate(backings):
+                if i <= plan.last:
+                    t = m.tensor(torch.int8, offset=plan.offsets[i], nbytes=size)
+                else:
+                    t = zeros(size)
+                for name in names:
+                    out[name] = t
+        else:
+            for i, (size, names) in enumerate(backings):
+                if i < plan.first:
+                    t = zeros(size)
+                else:
+                    t = m.tensor(torch.int8, offset=plan.offsets[i - plan.first], nbytes=size)
+                for name in names:
+                    out[name] = t
     except Exception:
         m.close()
         _give_up(lent)
         _over_budget("the KV cache could not be placed in the carveout")
         raise
     S.keep.append(m)
-    log.info("spark-attic: KV tensors %d-%d of %d in the display carveout (%d MiB), %d MiB of device memory glued "
-             "before it", plan.first, len(backings) - 1, len(backings), plan.attic_used // MIB, plan.front // MIB)
+    if S.placement.head:
+        log.info("spark-attic: KV tensors 0-%d of %d in the display carveout (%d MiB), %d MiB of device memory glued "
+                 "after it (head)", plan.last, len(backings), plan.attic_used // MIB, plan.front // MIB)
+    else:
+        log.info("spark-attic: KV tensors %d-%d of %d in the display carveout (%d MiB), %d MiB of device memory glued "
+                 "before it", plan.first, len(backings) - 1, len(backings), plan.attic_used // MIB, plan.front // MIB)
     return out
 
 
@@ -550,6 +584,36 @@ def _make_alloc_v3(orig):
 
 # -------------------------------------------------------------------------------------------------------- weights
 
+def _make_initialize(orig):
+    def initialize_model(*args, **kwargs):
+        model = orig(*args, **kwargs)
+        try:
+            _preplace(args[0] if args else kwargs.get("vllm_config"), model)
+        except Exception as e:
+            log.warning("spark-attic: weights stay in device memory (pre-place failed): %s: %s", type(e).__name__, e)
+        return model
+    return initialize_model
+
+
+def _preplace(vllm_config, model):
+    """load_weights runs next: give the parameters SPARK_ATTIC_WEIGHTS names carveout storage first, so the weights
+    fill the carveout and never touch device memory. vLLM measures device memory by what torch holds at the end of
+    load_model, so weights that live here never enter its figure and need no relief from it."""
+    if "weights" not in S.placement.place or S.settings is None:
+        return
+    if getattr(getattr(vllm_config, "model_config", None), "enable_sleep_mode", False):
+        log.warning("spark-attic: weights pre-placement off: sleep mode is on (vLLM's own CuMem pools hold the "
+                    "memory)")
+        return
+    placed = place_params(model, S.placement.weights, _pool("cuda"), S.ledger, S.keep)
+    if not placed:
+        return
+    for name, p, need in placed:
+        S.preplaced[id(p)] = (name, need, id(p.data))
+    log.info("spark-attic: %s get their carveout storage before load_weights (%d MiB); the weights fill it directly",
+             ", ".join(n for n, _, _ in placed), sum(b for _, _, b in placed) // MIB)
+
+
 def _make_load_model(orig):
     def load_model(self, *args, **kwargs):
         out = orig(self, *args, **kwargs)
@@ -563,7 +627,8 @@ def _make_load_model(orig):
 
 def _move_weights(worker):
     """Move the parameters SPARK_ATTIC_WEIGHTS names into the carveout and lower vLLM's weight figure by what that
-    freed."""
+    freed. Parameters the model construction already put in the carveout (the pre-place) pass by: their bytes were
+    never torch's, so vLLM's figure already excludes them."""
     why = _blocked(worker)
     if why:
         log.warning("spark-attic: weights placement off: %s", why)
@@ -572,8 +637,12 @@ def _move_weights(worker):
     if not isinstance(getattr(runner, "model_memory_usage", None), (int, float)):
         raise Mismatch("the model runner has no model_memory_usage")
     model = model_of(runner)
+    kept, skip = carved_params(model, S.preplaced)
+    if kept:
+        log.info("spark-attic: %s already in the carveout from model construction (%d MiB); vLLM's weight figure "
+                 "never counted them", ", ".join(n for n, _ in kept), sum(b for _, b in kept) // MIB)
     moved, freed = move_params(model, S.placement.weights, _pool(worker.device), S.ledger, S.keep,
-                               device_index(worker.device))
+                               device_index(worker.device), skip=skip)
     if not moved:
         return
     old = runner.model_memory_usage

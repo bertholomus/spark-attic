@@ -224,7 +224,8 @@ def case_heap_lend_and_reclaim(rig):
     check(st["state"] == "ready" and st["mode"] == "heap" and st["driver"] == DRIVER, "status: ready, heap, driver")
     inf = ask(rig.sock, info_req())
     want = 2046 * MIB  # 2 GiB carveout, 2 MiB of it RM's own: what GB10 shows
-    check(inf == {"ok": True, "size": want, "free": want, "largest": want}, "info: 2,046 MiB free in one run: %r" % inf)
+    check(inf == {"ok": True, "size": want, "free": want, "largest": want, "pages": "2MB pages"},
+          "info: 2,046 MiB free in one run: %r" % inf)
     pid, line = holder(rig.sock, want)
     check(line == "ok", "alloc: the largest run, one descriptor of that size: %s" % line)
     inf = ask(rig.sock, info_req())
@@ -501,7 +502,7 @@ def case_socket_path(rig):
 STATUS_SCHEMA = (("name", str), ("version", str), ("state", str), ("why", str), ("driver", str), ("mode", str),
                  ("validated", bool), ("validated_at", str), ("size_mib", int), ("free_mib", int),
                  ("largest_mib", int), ("lent_mib", int), ("draining_mib", int), ("clients", int), ("every_s", int),
-                 ("pid", int), ("updated", int))
+                 ("pages", str), ("pid", int), ("updated", int))
 
 
 def status_file(path, until=lambda st: True, seconds=8.0):
@@ -608,10 +609,33 @@ def case_attic_check(rig):
     rc, rep, p = run_check(rig, "heap")
     check(rc == 0 and rep and rep["pass"] is True, "attic-check passes heap on the fake: %s %s" % (p.stdout[-1500:], p.stderr[-500:]))
     ph = rep["phases"] if rep else {}
-    names = ("status", "full", "double", "isolation", "reclaim", "drain", "refusal")
+    names = ("status", "full", "double", "isolation", "bench", "compat", "reclaim", "drain", "refusal")
     check(all(ph.get(k, {}).get("pass") is True for k in names), "every phase passed: %r" % sorted(ph))
     check(ph.get("full", {}).get("size") == 254 * MIB and ph.get("full", {}).get("mismatches") == 0,
           "full: 254 MiB, every word twice, no mismatch")
+    b = ph.get("bench", {})
+    check(b.get("size") == 64 * MIB and b.get("pages") == "2MB pages" and b.get("gathers") == 4096
+          and b.get("granule") == 576 and all(b.get(k, 0) > 0 for k in
+          ("import_read_gbs", "import_write_gbs", "plain_read_gbs", "plain_write_gbs", "import_linear_gbs",
+           "plain_linear_gbs")),
+          "bench: a 64 MiB probe on both mappings, every number lands: %r" % (b,))
+    cm = ph.get("compat", {})
+    check(cm.get("size") == 16 * MIB and cm.get("memtype") == 2 and cm.get("mismatches") == 0
+          and cm.get("range_base", 0) > 0 and cm.get("range_size") == 16 * MIB and cm.get("driver_version") == 12080
+          and str(cm.get("lib", "")).endswith("libcuda.so.1"),
+          "compat: a 16 MiB probe, device memory type, the true range, the loaded libcuda: %r" % (cm,))
+    env = dict(os.environ, LD_LIBRARY_PATH=os.path.join(rig.bin, "fakecuda"))
+    p = subprocess.run([os.path.join(rig.bin, "attic-check"), "--phase", "compat", "--socket", rig.sock, "--key", KEY],
+                       env=dict(env, ATTIC_FAKECUDA_BADGETRANGE="1"), capture_output=True, text=True, timeout=120)
+    cm = json.loads(p.stdout)["compat"] if p.stdout.strip().startswith("{") else {}
+    check(p.returncode == 1 and cm.get("pass") is False and "cuMemGetAddressRange" in cm.get("why", ""),
+          "a compat driver that lies about the va range fails the check: %r" % (cm.get("why", ""),))
+    p = subprocess.run([os.path.join(rig.bin, "attic-check"), "--phase", "compat", "--socket", rig.sock, "--key", KEY],
+                       env=dict(env, ATTIC_FAKECUDA_HOSTMEMTYPE="1"), capture_output=True, text=True, timeout=120)
+    cm = json.loads(p.stdout)["compat"] if p.stdout.strip().startswith("{") else {}
+    check(p.returncode == 1 and cm.get("pass") is False and cm.get("memtype") == 1
+          and "MEMORY_TYPE" in cm.get("why", ""),
+          "a compat driver that calls the lent slice host memory fails the check: %r" % (cm.get("why", ""),))
     q = subprocess.run([os.path.join(rig.bin, "attic-check"), "--status", "--socket", rig.sock, "--key", KEY],
                        capture_output=True, text=True)
     check(q.returncode == 0 and json.loads(q.stdout)["state"] == "ready", "attic-check --status prints the status")
@@ -631,6 +655,10 @@ def case_attic_check(rig):
     rig.start("--candidate", cand, "--mode", "list", env=dict(small, ATTIC_FAKE_HELD="0"))
     rc, rep, p = run_check(rig, "list")
     check(rc == 0 and rep and rep["pass"] is True, "attic-check passes list on the fake: %s" % p.stdout[-1500:])
+    check(rep and rep["phases"]["bench"].get("skipped") == "list mode lends no descriptors",
+          "list: the bench is skipped and says why")
+    check(rep and rep["phases"]["compat"].get("skipped") == "list mode lends no descriptors",
+          "list: the compat phase is skipped and says why")
 
 
 def scripted_status(path, body):
@@ -956,6 +984,59 @@ def case_display4(rig):
     rig.stop()
 
 
+def case_scanout_lend(rig):
+    """A console that lights up while slices are lent, the whole story in one daemon run: new borrows stop at once
+    and say a display is using the memory, the slices already lent stay with their client, giving back still works
+    while the block is on (the display gate refuses new lends, it does not hold lent memory hostage), a borrow
+    asked while the console is still up stays refused after the giveback, and once the console leaves the idle
+    streak lifts the block and lending resumes. Why a plugged-in console cannot corrupt a lent slice in the first
+    place is RM's doing, not the gate's: ISO_YES+GPU_CACHEABLE_YES puts every slice in RM's refcounted carveout
+    heap, whose blocks are exclusive - the console's scanout surfaces are allocations of the same class and can
+    never alias a block RM has lent out - so the gate's job is only to keep atticd from racing RM for carveout
+    memory while the console is taking some."""
+    tree = os.path.join(rig.dir, "proc")
+    os.makedirs(tree, exist_ok=True)
+    rig.start("--modeset-dir", tree, "--pmon-file", pmon_file(rig, None),
+              "--drm-dir", os.path.join(rig.dir, "drm-none"))
+    pid, line = holder(rig.sock, 64 * MIB)
+    check(line == "ok", "a client lends 64 MiB while nothing displays")
+    # the console comes up mid-flight: a modeset holder, a connected connector and a type G sample together
+    os.makedirs(os.path.join(tree, "200", "fd"), exist_ok=True)
+    os.symlink("/dev/nvidia-modeset", os.path.join(tree, "200", "fd", "3"))
+    with open(os.path.join(tree, "200", "cmdline"), "wb") as f:
+        f.write(b"/usr/lib/xorg/Xorg\x00:0\x00")
+    drm(rig, {"card0-eDP-1": "connected"})
+    pmon_file(rig, ["0 4321 G 12 3 0 0 0 0"])
+    st = status_file(os.path.join(rig.dir, "status.json"),
+                     lambda s_: "a display is in use (pid 200" in s_["why"], 12.0)
+    check(st is not None and st["state"] == "refusing" and st["lent_mib"] == 64,
+          "the console lit up: new lends stop, the lent slice stays with its client: %r" % st)
+    r, fds = call(connect(rig.sock), alloc_req(8 * MIB))
+    check(r is not None and r["ok"] is False and "display is in use" in r["error"],
+          "a borrow while the console is up is refused: %r" % (r and r.get("error")))
+    for fd in fds:
+        os.close(fd)
+    # giving back is not gated: the client leaves, its slices count free, and lending still refuses
+    kill(pid)
+    check(wait_free(rig.sock, 2046 * MIB, 20.0) is not None, "the giveback lands while the console is still up")
+    r, fds = call(connect(rig.sock), alloc_req(8 * MIB))
+    check(r is not None and r["ok"] is False and "display is in use" in r["error"],
+          "after the giveback a borrow is still refused: %r" % (r and r.get("error")))
+    for fd in fds:
+        os.close(fd)
+    # the console leaves: the idle streak lifts the block and a fresh client lends again
+    os.unlink(os.path.join(tree, "200", "fd", "3"))
+    os.unlink(os.path.join(tree, "200", "cmdline"))
+    drm(rig, {"card0-eDP-1": "disconnected"})
+    pmon_file(rig, [])
+    st = status_file(os.path.join(rig.dir, "status.json"), lambda s_: s_["state"] == "ready", 20.0)
+    check(st is not None, "the console is gone: the idle streak lifts the block")
+    pid2, line2 = holder(rig.sock, 64 * MIB)
+    check(line2 == "ok", "lending resumes after the console left")
+    kill(pid2)
+    rig.stop()
+
+
 def case_display_beyond_budget(rig):
     """A display holder past the first 256 entries of a real-sized /proc: the one-shot readings - --probe-display
     and bring-up - walk the whole tree, not just the budget the tick keeps. Before the fix both read only the
@@ -1178,10 +1259,37 @@ def case_heap_start_short_recovery(rig):
     rig.stop()
 
 
+def case_pages_reported(rig):
+    """Owen's item 2: what page size RM granted the heap is visible everywhere the story is read. rmshim asks
+    RM for 2 MiB GPU pages first and falls back to RM's default when it refuses them; the fakeshim models both
+    (ATTIC_FAKE_NO_HUGE playing the refusal) and the answer rides the info and status replies and attic-check's
+    report."""
+    small = {"ATTIC_FAKE_REGION": "0x280000000:0x10000000"}  # 256 MiB keeps the host run quick
+    path = os.path.join(rig.dir, "status.json")
+    rig.start(env=small)
+    st = status_file(path, lambda s: s["state"] == "ready", 8.0)
+    check(st is not None and st["pages"] == "2MB pages", "the usual answer: RM granted 2 MiB pages: %r" % (st or {}).get("pages"))
+    r = ask(rig.sock, info_req())
+    check(r.get("pages") == "2MB pages", "the info reply names them too: %r" % (r or {}).get("pages"))
+    rc, rep, p = run_check(rig, "heap")
+    check(rc == 0 and rep and rep["phases"]["full"].get("pages") == "2MB pages",
+          "attic-check's report names the pages: %s" % p.stdout[-800:])
+    rig.stop()
+    rig.start(env=dict(small, ATTIC_FAKE_NO_HUGE="1"))
+    st = status_file(path, lambda s: s["pages"] == "default pages", 8.0)
+    check(st is not None and st["state"] == "ready", "after RM refuses 2 MiB pages the fallback is on the file: %r" % (st or {}).get("pages"))
+    r = ask(rig.sock, info_req())
+    check(r.get("pages") == "default pages", "the info reply names the fallback: %r" % (r or {}).get("pages"))
+    rc, rep, p = run_check(rig, "heap")
+    check(rc == 0 and rep and rep["phases"]["full"].get("pages") == "default pages",
+          "attic-check's report names the fallback: %s" % p.stdout[-800:])
+    rig.stop()
+
+
 CASES = [case_pmon_hang, case_heap_lend_and_reclaim, case_heap_client_death_recovery, case_heap_start_short_recovery,
          case_heap_drain, case_requests, case_refusals, case_export_failure, case_list_mode,
          case_sighup, case_candidate_keep_probe, case_socket_path, case_status_file, case_display, case_display3,
-         case_display4, case_display_beyond_budget, case_attic_check,
+         case_display4, case_scanout_lend, case_display_beyond_budget, case_attic_check, case_pages_reported,
          case_region_kinds, case_silent_client]
 
 

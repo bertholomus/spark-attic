@@ -43,7 +43,7 @@
 
 /* the version comes from the Makefile (ATTIC_VERSION); the fallback keeps a bare cc build honest */
 #ifndef ATTIC_VERSION_STR
-#define ATTIC_VERSION_STR "0.1.2"
+#define ATTIC_VERSION_STR "0.1.3"
 #endif
 #define CHECK_VERSION ATTIC_VERSION_STR
 #define CHUNK (64ull << 20)
@@ -189,6 +189,7 @@ static void jstr(const char *body, const char *name, char *out, size_t cap)
 struct info {
     uint64_t size, free, largest, base;
     int has_base;
+    char pages[32]; /* what page size RM granted the daemon's heap (atticd.c op_info) */
 };
 
 static int get_info(int fd, struct info *in, char *raw, size_t cap)
@@ -199,6 +200,7 @@ static int get_info(int fd, struct info *in, char *raw, size_t cap)
     if (jnum(raw, "size", &in->size) || jnum(raw, "free", &in->free) || jnum(raw, "largest", &in->largest))
         return -1;
     in->has_base = jnum(raw, "base", &in->base) == 0;
+    jstr(raw, "pages", in->pages, sizeof in->pages);
     return 0;
 }
 
@@ -227,17 +229,22 @@ static struct {
     CUresult (*ctx_retain)(void **, int);
     CUresult (*ctx_set)(void *);
     CUresult (*import)(CUhandle *, void *, int);
+    CUresult (*create)(CUhandle *, size_t, const MemProp *, unsigned long long);
     CUresult (*granularity)(size_t *, const MemProp *, int);
     CUresult (*reserve)(CUdeviceptr *, size_t, size_t, CUdeviceptr, unsigned long long);
     CUresult (*map)(CUdeviceptr, size_t, size_t, CUhandle, unsigned long long);
     CUresult (*access)(CUdeviceptr, size_t, const void *, size_t);
     CUresult (*htod)(CUdeviceptr, const void *, size_t);
     CUresult (*dtoh)(void *, CUdeviceptr, size_t);
+    CUresult (*dtod)(CUdeviceptr, CUdeviceptr, size_t);
     CUresult (*sync)(void);
     CUresult (*unmap)(CUdeviceptr, size_t);
     CUresult (*addr_free)(CUdeviceptr, size_t);
     CUresult (*release)(CUhandle);
     CUresult (*err_name)(CUresult, const char **);
+    CUresult (*driver_version)(int *);
+    CUresult (*getrange)(CUdeviceptr *, size_t *, CUdeviceptr);
+    CUresult (*ptr_attr)(void *, int, CUdeviceptr);
 } cu;
 
 static char cu_err[256];
@@ -262,18 +269,29 @@ static int cuda_load(void)
     SYM(ctx_retain, "cuDevicePrimaryCtxRetain");
     SYM(ctx_set, "cuCtxSetCurrent");
     SYM(import, "cuMemImportFromShareableHandle");
+    SYM(create, "cuMemCreate");
     SYM(granularity, "cuMemGetAllocationGranularity");
     SYM(reserve, "cuMemAddressReserve");
     SYM(map, "cuMemMap");
     SYM(access, "cuMemSetAccess");
     SYM(htod, "cuMemcpyHtoD_v2");
     SYM(dtoh, "cuMemcpyDtoH_v2");
+    SYM(dtod, "cuMemcpyDtoD_v2");
     SYM(sync, "cuCtxSynchronize");
     SYM(unmap, "cuMemUnmap");
     SYM(addr_free, "cuMemAddressFree");
     SYM(release, "cuMemRelease");
     SYM(err_name, "cuGetErrorName");
+    SYM(driver_version, "cuDriverGetVersion");
+    SYM(ptr_attr, "cuPointerGetAttribute");
 #undef SYM
+    *(void **)&cu.getrange = dlsym(l, "cuMemGetAddressRange_v2");
+    if (cu.getrange == NULL)
+        *(void **)&cu.getrange = dlsym(l, "cuMemGetAddressRange"); /* some drivers export only the plain name */
+    if (cu.getrange == NULL) {
+        snprintf(cu_err, sizeof cu_err, "libcuda has neither cuMemGetAddressRange_v2 nor cuMemGetAddressRange");
+        return -1;
+    }
     return 0;
 }
 
@@ -297,6 +315,28 @@ static int cuda_up(int *dev)
         !cu_ok(cu.ctx_retain(&ctx, *dev), "cuDevicePrimaryCtxRetain") || !cu_ok(cu.ctx_set(ctx), "cuCtxSetCurrent"))
         return -1;
     return 0;
+}
+
+/* The libcuda.so.1 this process actually runs (a forward-compat package loads its own copy from its own directory). */
+static void libcuda_path(char *dst, size_t n)
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    snprintf(dst, n, "?");
+    if (f == NULL)
+        return;
+    char line[512];
+    while (fgets(line, sizeof line, f))
+        if (strstr(line, "libcuda.so.1")) {
+            char *p = strrchr(line, ' '); /* the path is the line's last field */
+            if (p) {
+                char *e = line + strlen(line);
+                if (e > line && e[-1] == '\n')
+                    e[-1] = 0;
+                snprintf(dst, n, "%s", p + 1);
+            }
+            break;
+        }
+    fclose(f);
 }
 
 struct mapped {
@@ -489,12 +529,12 @@ static int phase_full(void)
     ok &= full_ok;
     emit("{\"full\":{\"pass\":%s,\"size\":%" PRIu64 ",\"free_before\":%" PRIu64 ",\"words\":%" PRIu64
          ",\"mismatches\":%" PRIu64 ",\"first_bad\":%" PRId64 ",\"write_gbs\":%.2f,\"read_gbs\":%.2f,"
-         "\"memfree_drop_mib\":%" PRId64 ",\"base\":%" PRId64 ",\"system_ram\":%d,",
+         "\"memfree_drop_mib\":%" PRId64 ",\"base\":%" PRId64 ",\"system_ram\":%d,\"pages\":\"%s\",",
          full_ok ? "true" : "false", in.largest, in.free, in.largest / 4 * 2, a.mismatches + b.mismatches,
          a.mismatches ? (int64_t)a.first_bad : b.mismatches ? (int64_t)b.first_bad : (int64_t)-1,
          rc == 0 ? 2.0 * (double)in.largest / (a.write_s + b.write_s) / 1e9 : 0.0,
          rc == 0 ? 2.0 * (double)in.largest / (a.read_s + b.read_s) / 1e9 : 0.0, dropped / (1 << 20),
-         in.has_base ? (int64_t)in.base : (int64_t)-1, in.has_base ? ram : -2);
+         in.has_base ? (int64_t)in.base : (int64_t)-1, in.has_base ? ram : -2, in.pages);
     emit_text("why", rc != 0 ? cu_err : ramwhy);
     emit("},");
 
@@ -521,6 +561,259 @@ static int phase_full(void)
         close(c2);
     unmap_release(&mp);
     close(c);
+    return ok ? 0 : 1;
+}
+
+/* ---- the bench ----
+ * What the memory atticd lends behaves like on this node, in one process: the imported slice (the carveout,
+ * GPU_CACHEABLE_YES, 2 MiB pages when RM granted them) against an ordinary cuMemCreate allocation of the same size
+ * beside it. Each is read and written by 576-byte copies at pseudo-random offsets (the TLB-miss / random-stride
+ * probe) and once linearly, timed with one sync per round and an untimed warmup. A pass says the plumbing ran; the
+ * speeds are the node's to judge. */
+
+#define BENCH_GRANULE 576
+#define BENCH_GATHERS 4096   /* copies per round, per direction */
+#define BENCH_ROUNDS 8
+#define BENCH_CAP (64u << 20) /* the probe slice is at most this big */
+
+static uint64_t rnd_off(uint64_t *s, size_t chunks)
+{
+    *s = *s * 6364136223846793005ull + 1442695040888963407ull;
+    return ((*s >> 17) % chunks) * BENCH_GRANULE;
+}
+
+/* An ordinary (not imported) device allocation, mapped read-write: what the framework's own allocator would get. */
+static int create_map(int dev, size_t size, struct mapped *mp)
+{
+    MemProp prop;
+    memset(&prop, 0, sizeof prop);
+    prop.type = 1;          /* CU_MEM_ALLOCATION_TYPE_PINNED */
+    prop.location.type = 1; /* CU_MEM_LOCATION_TYPE_DEVICE */
+    prop.location.id = dev;
+    size_t g = 0;
+    if (!cu_ok(cu.granularity(&g, &prop, 0), "cuMemGetAllocationGranularity"))
+        return -1;
+    memset(mp, 0, sizeof *mp);
+    mp->size = size;
+    if (!cu_ok(cu.create(&mp->h, size, &prop, 0), "cuMemCreate"))
+        return -1;
+    if (!cu_ok(cu.reserve(&mp->va, size, g, 0, 0), "cuMemAddressReserve")) {
+        cu.release(mp->h);
+        return -1;
+    }
+    if (!cu_ok(cu.map(mp->va, size, 0, mp->h, 0), "cuMemMap")) {
+        cu.addr_free(mp->va, size);
+        cu.release(mp->h);
+        return -1;
+    }
+    MemAccess acc;
+    memset(&acc, 0, sizeof acc);
+    acc.location.type = 1;
+    acc.location.id = dev;
+    acc.flags = 3; /* CU_MEM_ACCESS_FLAGS_PROT_READWRITE */
+    if (!cu_ok(cu.access(mp->va, size, &acc, 1), "cuMemSetAccess")) {
+        cu.unmap(mp->va, size);
+        cu.addr_free(mp->va, size);
+        cu.release(mp->h);
+        return -1;
+    }
+    return 0;
+}
+
+/* BENCH_GATHERS copies of BENCH_GRANULE bytes and one sync: seconds, or -1 on a CUDA error. One end of every copy
+ * wanders over `wander`; the other sits at `fixed` (one cached spot, so only the wandering side pays for pages). */
+static double bench_gathers(CUdeviceptr wander, CUdeviceptr fixed, int wander_is_src, uint64_t seed, size_t size)
+{
+    size_t chunks = size / BENCH_GRANULE;
+    double t0 = now_s();
+    for (int i = 0; i < BENCH_GATHERS; i++) {
+        CUdeviceptr off = (CUdeviceptr)rnd_off(&seed, chunks);
+        int ok = wander_is_src ? cu.dtod(fixed, wander + off, BENCH_GRANULE)
+                               : cu.dtod(wander + off, fixed, BENCH_GRANULE);
+        if (!cu_ok(ok, "cuMemcpyDtoD"))
+            return -1;
+    }
+    if (!cu_ok(cu.sync(), "cuCtxSynchronize"))
+        return -1;
+    return now_s() - t0;
+}
+
+static double bench_linear(CUdeviceptr from, CUdeviceptr to, size_t size)
+{
+    double t0 = now_s();
+    if (!cu_ok(cu.dtod(to, from, size), "cuMemcpyDtoD") || !cu_ok(cu.sync(), "cuCtxSynchronize"))
+        return -1;
+    return now_s() - t0;
+}
+
+static int phase_bench(void)
+{
+    char raw[ATTIC_REPLY_MAX + 1];
+    struct info in;
+    int dev;
+    if (cuda_up(&dev) != 0) {
+        emit("{\"bench\":{\"pass\":false,");
+        emit_text("why", cu_err);
+        emit("}}");
+        return 1;
+    }
+    int c = dial();
+    if (c < 0 || get_info(c, &in, raw, sizeof raw) != 0) {
+        emit("{\"bench\":{\"pass\":false,");
+        emit_text("why", c < 0 ? "cannot connect" : raw);
+        emit("}}");
+        return 1;
+    }
+    uint64_t size = in.largest < BENCH_CAP ? in.largest : BENCH_CAP;
+    size -= size % ATTIC_SLICE;
+    if (size < 4 * ATTIC_SLICE) {
+        emit("{\"bench\":{\"pass\":false,");
+        emit_text("why", "less than 8 MiB free: the bench needs a place");
+        emit("}}");
+        return 1;
+    }
+    int fd;
+    if (request(c, "alloc", size, raw, sizeof raw, &fd) != 0 || !jtrue(raw, "ok") || fd < 0) {
+        emit("{\"bench\":{\"pass\":false,");
+        emit_text("why", raw);
+        emit("}}");
+        return 1;
+    }
+    close(c);
+    struct mapped imp, plain;
+    double ir = 0, iw = 0, pr = 0, pw = 0, il = 0, pl = 0;
+    int have_imp = import_map(dev, fd, size, &imp) == 0;
+    int have_plain = have_imp && create_map(dev, size, &plain) == 0;
+    if (!have_plain) {
+        emit("{\"bench\":{\"pass\":false,");
+        emit_text("why", cu_err);
+        emit("}}");
+        if (have_imp)
+            unmap_release(&imp);
+        return 1;
+    }
+    bench_gathers(imp.va, plain.va, 1, 1, size); /* warm both sides, both directions: untimed */
+    bench_gathers(plain.va, imp.va, 1, 2, size);
+    int ok = 1;
+    for (int r = 0; r < BENCH_ROUNDS && ok; r++) {
+        uint64_t s = (uint64_t)r * 0x9E3779B97F4A7C15ull;
+        double d;
+        if ((d = bench_gathers(imp.va, plain.va, 1, s + 11, size)) < 0 || (ir += d, 0) ||
+            (d = bench_gathers(imp.va, plain.va, 0, s + 22, size)) < 0 || (iw += d, 0) ||
+            (d = bench_gathers(plain.va, imp.va, 1, s + 33, size)) < 0 || (pr += d, 0) ||
+            (d = bench_gathers(plain.va, imp.va, 0, s + 44, size)) < 0 || (pw += d, 0) ||
+            (d = bench_linear(imp.va, plain.va, size)) < 0 || (il += d, 0) ||
+            (d = bench_linear(plain.va, imp.va, size)) < 0 || (pl += d, 0))
+            ok = 0;
+    }
+    unmap_release(&imp);
+    unmap_release(&plain);
+    if (!ok) {
+        emit("{\"bench\":{\"pass\":false,");
+        emit_text("why", cu_err);
+        emit("}}");
+        return 1;
+    }
+    double moved = (double)BENCH_ROUNDS * BENCH_GATHERS * BENCH_GRANULE;
+    emit("{\"bench\":{\"pass\":true,\"size\":%" PRIu64 ",\"pages\":\"%s\",\"gathers\":%d,\"rounds\":%d,"
+         "\"granule\":%d,\"import_read_gbs\":%.2f,\"import_write_gbs\":%.2f,\"plain_read_gbs\":%.2f,"
+         "\"plain_write_gbs\":%.2f,\"import_linear_gbs\":%.2f,\"plain_linear_gbs\":%.2f}}",
+         size, in.pages, BENCH_GATHERS, BENCH_ROUNDS, BENCH_GRANULE, moved / ir / 1e9, moved / iw / 1e9,
+         moved / pr / 1e9, moved / pw / 1e9, size * BENCH_ROUNDS / il / 1e9, size * BENCH_ROUNDS / pl / 1e9);
+    return 0;
+}
+
+/* ---- the compat check ----
+ * Owen's item 4: a forward-compatibility libcuda (the cuda-compat package) loaded over an older host driver must
+ * still import a lent descriptor, map it, copy through it and answer the pointer questions the frameworks ask. The
+ * phase reports which libcuda the process really loaded and the driver API version it claims, then checks the two
+ * answers a compat driver is known to get wrong: cuMemGetAddressRange and CU_POINTER_ATTRIBUTE_MEMORY_TYPE (a driver
+ * that reports the lent slice as host memory makes every copy library treat the pointer wrong). */
+
+#define COMPAT_CAP (16u << 20) /* the compat probe slice is at most this big */
+
+static int phase_compat(void)
+{
+    char raw[ATTIC_REPLY_MAX + 1];
+    struct info in;
+    int dev;
+    if (cuda_up(&dev) != 0) {
+        emit("{\"compat\":{\"pass\":false,");
+        emit_text("why", cu_err);
+        emit("}}");
+        return 1;
+    }
+    char lib[256];
+    libcuda_path(lib, sizeof lib);
+    int drvver = 0;
+    cu.driver_version(&drvver);
+    int c = dial();
+    if (c < 0 || get_info(c, &in, raw, sizeof raw) != 0) {
+        emit("{\"compat\":{\"pass\":false,");
+        emit_text("why", c < 0 ? "cannot connect"
+                               : raw[0] ? raw : "the daemon did not answer the info request");
+        emit("}}");
+        return 1;
+    }
+    uint64_t size = in.largest < COMPAT_CAP ? in.largest : COMPAT_CAP;
+    size -= size % ATTIC_SLICE;
+    if (size < 2 * ATTIC_SLICE) {
+        emit("{\"compat\":{\"pass\":false,");
+        emit_text("why", "less than 4 MiB free: the compat check needs a place");
+        emit("}}");
+        return 1;
+    }
+    int fd;
+    if (request(c, "alloc", size, raw, sizeof raw, &fd) != 0 || !jtrue(raw, "ok") || fd < 0) {
+        emit("{\"compat\":{\"pass\":false,");
+        emit_text("why", raw);
+        emit("}}");
+        return 1;
+    }
+    close(c);
+    struct mapped mp;
+    if (import_map(dev, fd, size, &mp) != 0) {
+        close(fd);
+        emit("{\"compat\":{\"pass\":false,\"size\":%" PRIu64 ",", size);
+        emit_text("why", cu_err);
+        emit("}}");
+        return 1;
+    }
+    close(fd);
+    uint32_t *buf = malloc(CHUNK), *back = malloc(CHUNK);
+    struct pass a;
+    int rc = buf == NULL || back == NULL ? -1 : write_read(&mp, 0x5eed, 0, buf, back, &a);
+    free(buf);
+    free(back);
+    CUdeviceptr base = 0;
+    size_t span = 0;
+    int gr = cu.getrange(&base, &span, mp.va);
+    unsigned memtype = 0;
+    int pt = cu.ptr_attr(&memtype, 2, mp.va); /* 2: CU_POINTER_ATTRIBUTE_MEMORY_TYPE */
+    unmap_release(&mp);
+    int range_ok = gr == 0 && base == mp.va && span == mp.size;
+    int type_ok = pt == 0 && memtype == 2; /* CU_MEMORYTYPE_DEVICE */
+    int ok = rc == 0 && a.mismatches == 0 && range_ok && type_ok;
+    char why[512] = "";
+    if (rc != 0)
+        snprintf(why, sizeof why, "%s", cu_err);
+    else if (gr != 0)
+        snprintf(why, sizeof why, "%s", cu_ok(gr, "cuMemGetAddressRange") == 0 ? cu_err : "cuMemGetAddressRange");
+    else if (!range_ok)
+        snprintf(why, sizeof why, "cuMemGetAddressRange says %#llx+%zu for a slice mapped at %#llx+%zu",
+                 (unsigned long long)base, span, (unsigned long long)mp.va, mp.size);
+    else if (pt != 0)
+        snprintf(why, sizeof why, "%s", cu_ok(pt, "cuPointerGetAttribute") == 0 ? cu_err : "cuPointerGetAttribute");
+    else if (!type_ok)
+        snprintf(why, sizeof why, "cuPointerGetAttribute(MEMORY_TYPE) says %u, device memory is 2", memtype);
+    emit("{\"compat\":{\"pass\":%s,\"size\":%" PRIu64 ",\"driver_version\":%d,\"range_base\":%llu,"
+         "\"range_size\":%zu,\"memtype\":%u,\"mismatches\":%" PRIu64 ",",
+         ok ? "true" : "false", size, drvver, gr == 0 ? (unsigned long long)base : 0ull, gr == 0 ? span : 0,
+         memtype, a.mismatches);
+    emit_text("lib", lib);
+    emit(",");
+    emit_text("why", why);
+    emit("}}");
     return ok ? 0 : 1;
 }
 
@@ -793,6 +1086,8 @@ int main(int argc, char **argv)
     if (phase) {
         int rc = strcmp(phase, "full") == 0        ? phase_full()
                  : strcmp(phase, "isolation") == 0 ? phase_isolation()
+                 : strcmp(phase, "bench") == 0     ? phase_bench()
+                 : strcmp(phase, "compat") == 0    ? phase_compat()
                  : strcmp(phase, "hold") == 0      ? phase_hold(0)
                  : strcmp(phase, "hold-close") == 0 ? phase_hold(1)
                                                     : 2;
@@ -904,6 +1199,33 @@ int main(int argc, char **argv)
         emit_text("why", res);
         emit("},");
         pass = 0;
+    }
+    if (strcmp(mode, "heap") == 0) {
+        rc = run_child("bench", res, sizeof res);
+        pass &= rc == 0;
+        if (res[0] == '{' && res[strlen(res) - 1] == '}') {
+            res[strlen(res) - 1] = 0;
+            emit("%s,", res + 1);
+        } else {
+            emit("\"bench\":{\"pass\":false,");
+            emit_text("why", res);
+            emit("},");
+            pass = 0;
+        }
+        rc = run_child("compat", res, sizeof res);
+        pass &= rc == 0;
+        if (res[0] == '{' && res[strlen(res) - 1] == '}') {
+            res[strlen(res) - 1] = 0;
+            emit("%s,", res + 1);
+        } else {
+            emit("\"compat\":{\"pass\":false,");
+            emit_text("why", res);
+            emit("},");
+            pass = 0;
+        }
+    } else {
+        emit("\"bench\":{\"pass\":true,\"skipped\":\"list mode lends no descriptors\"},");
+        emit("\"compat\":{\"pass\":true,\"skipped\":\"list mode lends no descriptors\"},");
     }
     pass &= phase_reclaim(0, total);
     pass &= phase_reclaim(1, total);

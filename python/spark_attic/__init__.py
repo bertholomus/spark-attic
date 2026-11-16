@@ -22,7 +22,7 @@ from . import _cuda
 from ._cuda import CudaError
 from ._proto import DEFAULT_SOCK, SLICE, Attic, AtticError, Settings, key_ok
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __all__ = ["Attic", "AtticError", "CudaError", "Lent", "Mapping", "Pool", "Settings", "borrow", "info", "SLICE",
            "DEFAULT_SOCK", "key_ok"]
 log = logging.getLogger("spark_attic")
@@ -177,19 +177,23 @@ class Pool:
         """Borrow nbytes (whole 2 MiB slices) as one slice, imported but not mapped: a Lent for map()."""
         return Lent(self.device, self._slice(nbytes), nbytes)
 
-    def map(self, front, attic_slices, owns_attic=False):
-        """A Mapping of `front` bytes of ordinary device memory followed by the attic slices: each a size (a multiple
-        of 2 MiB, borrowed now) or a Lent from lend(), which the mapping takes over, or releases if map() fails."""
+    def map(self, front, attic_slices, owns_attic=False, device_after=False):
+        """A Mapping of the attic slices and `front` bytes of ordinary device memory: device memory first, then the
+        slices (the tail plan's order); with device_after, the slices first and `front` glued behind them (the head
+        plan's). Each entry is a size (a multiple of 2 MiB, borrowed now) or a Lent from lend(), which the mapping
+        takes over, or releases if map() fails."""
         parts = []
         try:
-            if front:
-                parts.append((_cuda.create(_round_up(front, self.granularity), self.device),
-                              _round_up(front, self.granularity), "device"))
+            device = (_cuda.create(_round_up(front, self.granularity), self.device),
+                      _round_up(front, self.granularity), "device") if front else None
+            attic = []
             for s in attic_slices:
                 if isinstance(s, Lent):
-                    parts.append((s.take(), s.size, "attic"))
+                    attic.append((s.take(), s.size, "attic"))
                 else:
-                    parts.append((self._slice(s), s, "attic"))
+                    attic.append((self._slice(s), s, "attic"))
+            parts = attic + [device] if device_after else [device] + attic
+            parts = [p for p in parts if p is not None]
             va = _cuda.map_parts(self.device, [(h, n) for h, n, _ in parts], self.granularity)
         except Exception:
             _release(self.device, None, parts, None)

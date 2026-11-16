@@ -111,12 +111,19 @@ class Worker:
         self.available_kv_cache_memory_bytes = self.budget - int(self.model_runner.model_memory_usage)
         return int(self.available_kv_cache_memory_bytes)
 '''
+LOADER_SRC = '''
+def initialize_model(vllm_config=None, *, prefix="", model_class=None, model_config=None):
+    """As vLLM 0.24.0 and 0.32.0: keyword-only after vllm_config; builds the model and returns it."""
+    return model_config["model"]
+'''
 
 
 def tree(attn_params="kv_cache_config, shared_layers, device", extra_field=""):
     return {
         "vllm/__init__.py": PKG, "vllm/v1/__init__.py": PKG, "vllm/v1/worker/__init__.py": PKG,
         "vllm/v1/worker/gpu/__init__.py": PKG,
+        "vllm/model_executor/__init__.py": PKG, "vllm/model_executor/model_loader/__init__.py": PKG,
+        "vllm/model_executor/model_loader/utils.py": LOADER_SRC,
         "vllm/v1/kv_cache_interface.py": KV_IFACE.replace("    block_stride: int = 0",
                                                           "    block_stride: int = 0" + extra_field),
         "vllm/v1/worker/gpu_worker.py": WORKER_SRC,
@@ -301,6 +308,21 @@ def case_tail_plan(rig):
           "2 MiB boundaries: 5 MiB + 1 takes 6, 3 takes 4: %r" % (p,))
     p = _place.tail_plan([], 4 * MIB)
     check((p.first, p.front, p.offsets, p.attic_used) == (0, 0, (), 0), "nothing to place: %r" % (p,))
+    p = _place.head_plan([27 * MIB] * 6, 62 * MIB)
+    check((p.last, p.front, p.offsets, p.attic_used) == (2, 22 * MIB, (0, 28 * MIB, 56 * MIB), 62 * MIB),
+          "head: the first three of six 27 MiB tensors, the third of them split 6 + 22: %r" % (p,))
+    p = _place.head_plan([10 * MIB] * 3, 62 * MIB)
+    check((p.last, p.front, p.offsets, p.attic_used) == (2, 0, (0, 10 * MIB, 20 * MIB), 30 * MIB),
+          "head, all fit: %r" % (p,))
+    p = _place.head_plan([20 * MIB] * 3, 40 * MIB)
+    check((p.last, p.front, p.offsets, p.attic_used) == (1, 0, (0, 20 * MIB), 40 * MIB), "head, an exact fit: %r" % (p,))
+    p = _place.head_plan([100 * MIB], 62 * MIB)
+    check((p.last, p.front, p.offsets, p.attic_used) == (0, 38 * MIB, (0,), 62 * MIB), "head, one big tensor: %r" % (p,))
+    p = _place.head_plan([5 * MIB + 1, 3 * MIB], 4 * MIB)
+    check((p.last, p.front, p.offsets, p.attic_used) == (0, 2 * MIB, (0,), 4 * MIB),
+          "head, 2 MiB boundaries: 5 MiB + 1 takes 6, 3 takes 4: %r" % (p,))
+    p = _place.head_plan([], 4 * MIB)
+    check((p.last, p.front, p.offsets, p.attic_used) == (-1, 0, (), 0), "head, nothing to place: %r" % (p,))
 
 
 def case_settings(rig):
@@ -308,7 +330,11 @@ def case_settings(rig):
     check(P({}) == _place.Placement(("kv",), ("embed_tokens",), 0), "default: kv, embed_tokens, no cap: %r" % (P({}),))
     check(P({"SPARK_ATTIC_PLACE": "weights, kv"}).place == ("kv", "weights"), "weights,kv")
     check(P({"SPARK_ATTIC_PLACE": "off"}).place == (), "off")
-    for bad in ({"SPARK_ATTIC_PLACE": "kv,bogus"}, {"SPARK_ATTIC_PLACE": ","}, {"SPARK_ATTIC_MIB": "1.5"}):
+    check(P({"SPARK_ATTIC_KV_HEAD": "1"}).head is True, "kv head on")
+    check(P({"SPARK_ATTIC_KV_HEAD": "yes"}).head is True and P({"SPARK_ATTIC_KV_HEAD": "0"}).head is False
+          and P({}).head is False, "kv head off, unset off")
+    for bad in ({"SPARK_ATTIC_PLACE": "kv,bogus"}, {"SPARK_ATTIC_PLACE": ","}, {"SPARK_ATTIC_MIB": "1.5"},
+                {"SPARK_ATTIC_KV_HEAD": "maybe"}):
         try:
             P(bad)
             check(False, "refused: %r" % bad)
@@ -404,6 +430,36 @@ def case_kv_v2(rig):
     check(inf and inf["free"] == 62 * MIB, "closed: all given back: %r" % inf)
 
 
+def case_kv_head(rig):
+    """SPARK_ATTIC_KV_HEAD=1: the mirror placement — KV block 0 and its neighbours in the carveout, device memory
+    glued behind the slice, the tail of the cache where vLLM puts it."""
+    rig.start(env=SMALL)
+    v = Vllm(env_for(rig, KV_HEAD="1"))
+    try:
+        w = v.worker(v.r2.GPUModelRunner(Device("cuda:0")), 100 * MIB)
+        check(w.determine_available_memory() == 162 * MIB,
+              "the budget rises as always: %d MiB" % (w.available_kv_cache_memory_bytes // MIB))
+        out = w.model_runner.initialize_kv_cache(v.config([27 * MIB] * 6))
+        kinds = [out["layer.%d" % i].kind for i in range(6)]
+        check(kinds == ["va"] * 3 + ["buf"] * 3, "head: layers 0-2 in the mapping, 3-5 where vLLM puts them: %r" % kinds)
+        m = vllm_plugin.S.keep[0]
+        vas = [out["layer.%d" % i].va for i in (0, 1, 2)]
+        check(m.size == 84 * MIB and m.attic_bytes == 62 * MIB and vas == [m.ptr, m.ptr + 28 * MIB, m.ptr + 56 * MIB]
+              and all(out["layer.%d" % i].nbytes == 27 * MIB for i in range(6)),
+              "62 MiB attic first + 22 MiB device behind it, tensors at 0, 28, 56 MiB: %r %r" % (m, vas))
+        check(m.read(0, 4096) == bytes(4096), "the mapping is zeroed")
+        seam = TORCH.zeros(27 * MIB)
+        data = pattern(8192, 5)
+        ctypes.memmove(ctypes.addressof(seam.buf), data, 8192)
+        out["layer.0"].copy_(seam)
+        check(m.read(0, 8192) == data, "a write into the carved head reads back")
+        check(LOGS.has("glued after it"), "the log names the head plan: %r" % LOGS.lines[-3:])
+    finally:
+        v.done()
+    inf = wait_free(rig.sock, 62 * MIB)
+    check(inf and inf["free"] == 62 * MIB, "closed: all given back: %r" % inf)
+
+
 def case_kv_v1_packed(rig):
     rig.start(env=SMALL)
     v = Vllm(env_for(rig, PLACE="kv"))
@@ -445,6 +501,92 @@ def case_weights(rig):
         check(w.model_runner.model_memory_usage == MIB, "vLLM's weight figure drops by what was freed: %d"
               % w.model_runner.model_memory_usage)
         check(w.determine_available_memory() == 99 * MIB, "so its own sum gives the KV cache that much more")
+    finally:
+        v.done()
+    wait_free(rig.sock, 62 * MIB)
+
+
+def case_preplace(rig):
+    """weights: the loader's initialize_model gives the parameters carveout storage BEFORE load_weights fills them;
+    vLLM's own figure never counted bytes it never held, so the move step leaves the figure alone."""
+    rig.start(env=SMALL)
+    v = Vllm(env_for(rig, PLACE="weights"))
+    try:
+        nb = 1281 * 2048 * 2
+
+        def fresh():
+            embed = TORCH.param(nb, TORCH.float16, (1281, 2048), 3)
+            return Model([("model.embed_tokens.weight", embed),
+                          ("model.layers.0.w", TORCH.param(MIB, TORCH.bfloat16, (512, 1024), 9)),
+                          ("lm_head.weight", embed)])
+
+        r = v.r2.GPUModelRunner(Device("cuda:0"))
+        state = {}
+
+        def load(load_dummy_weights=False):
+            from vllm.model_executor.model_loader import utils as ml
+            r.model = ml.initialize_model(vllm_config=None, model_config={"model": fresh()})
+            for _, p in r.model.named_parameters(remove_duplicate=False):
+                p.data.put(b"\x07" * p.numel() * p.element_size())  # a weight loader filling p.data in place
+            r.model_memory_usage = sum(p.numel() * p.element_size() for _, p in r.model.named_parameters())
+            state["model"] = r.model
+
+        r.load_model = load
+        w = v.worker(r, 100 * MIB)
+        w.load_model()
+        utils_mod = sys.modules.get("vllm.model_executor.model_loader.utils")
+        check(getattr(utils_mod.initialize_model, "__spark_attic__", False), "initialize_model wrapped")
+        named = dict(state["model"].named_parameters(remove_duplicate=False))
+        embed, other = named["model.embed_tokens.weight"], named["model.layers.0.w"]
+        check(embed.data.kind == "va" and embed.data.dtype is TORCH.float16 and embed.data.shape == (1281, 2048),
+              "embed_tokens lives in the carveout from model construction: %s" % embed.data.kind)
+        check(embed.data.raw() == b"\x07" * nb, "the weights filled the carveout: 0x07 * %d" % nb)
+        check(named["lm_head.weight"] is embed, "the tied lm_head shares it")
+        check(other.data.kind == "buf", "unmatched weights stay in device memory")
+        check(len(vllm_plugin.S.keep) == 1 and lent(rig) == 6 * MIB, "one 6 MiB slice, spent once")
+        check(w.model_runner.model_memory_usage == nb + MIB,
+              "vLLM's figure keeps its own sum: %d" % w.model_runner.model_memory_usage)
+        check(LOGS.has("get their carveout storage before load_weights") and LOGS.has("fill it directly"),
+              "the pre-place says so in one line")
+        check(LOGS.has("already in the carveout from model construction")
+              and not LOGS.has("moved to the display carveout"), "the move step passes them by")
+    finally:
+        v.done()
+    wait_free(rig.sock, 62 * MIB)
+
+
+def case_pplace_refuses(rig):
+    """weights: with too little carveout the pre-place fails open loudly and nothing is spent."""
+    rig.start(env=SMALL)
+    v = Vllm(env_for(rig, PLACE="weights", MIB="2"))
+    try:
+        nb = 1281 * 2048 * 2
+
+        def fresh():
+            return Model([("model.embed_tokens.weight", TORCH.param(nb, TORCH.float16, (1281, 2048), 3)),
+                          ("model.layers.0.w", TORCH.param(MIB, TORCH.bfloat16, (512, 1024), 9))])
+
+        r = v.r2.GPUModelRunner(Device("cuda:0"))
+
+        def load(load_dummy_weights=False):
+            from vllm.model_executor.model_loader import utils as ml
+            r.model = ml.initialize_model(vllm_config=None, model_config={"model": fresh()})
+            for _, p in r.model.named_parameters(remove_duplicate=False):
+                p.data.put(b"\x07" * p.numel() * p.element_size())
+            r.model_memory_usage = sum(p.numel() * p.element_size() for _, p in r.model.named_parameters())
+
+        r.load_model = load
+        w = v.worker(r, 100 * MIB)
+        w.load_model()
+        named = dict(r.model.named_parameters(remove_duplicate=False))
+        check(named["model.embed_tokens.weight"].data.kind == "buf",
+              "the pre-place refuses: embed stays in device memory")
+        check(LOGS.has("it needs 6 MiB, 2 MiB of carveout is left"), "the refusal says what it needs and what is left")
+        check(not LOGS.has("moved to the display carveout") and not LOGS.has("carveout from model construction"),
+              "the move refuses too: nothing spent, nothing moved")
+        check(w.model_runner.model_memory_usage == nb + MIB, "the figure is untouched: %d"
+              % w.model_runner.model_memory_usage)
+        check(w.determine_available_memory() == 100 * MIB - (nb + MIB), "so the KV cache loses nothing it had")
     finally:
         v.done()
     wait_free(rig.sock, 62 * MIB)
@@ -720,8 +862,20 @@ def case_upstream(rig):
                    + ([a.kwarg] if a.kwarg else [])] if a else None
             check(got == want, "%s: %s.%s: (%s) as the plugin expects: %r" % (tag, mod, qual, ", ".join(want), got))
             decos = [ast.unparse(d) for d in fn.decorator_list] if fn else []
-            check(set(decos) <= KEEP_PARAMS, "%s: %s.%s: decorators that keep its parameters, read through: %r"
+            # instrument(span_name=...) wraps with functools.wraps (or returns the function plain with no backend),
+            # so the plugin reads the parameters through it exactly like inference_mode
+            check(all(d in KEEP_PARAMS or d.startswith("instrument(") for d in decos),
+                  "%s: %s.%s: decorators that keep its parameters, read through: %r"
                   % (tag, mod, qual, decos))
+        # the pre-place rides initialize_model: the base loader builds the model before load_weights fills it
+        bl = parse(src, "vllm.model_executor.model_loader.base_loader")
+        seam = [fn for fn in ast.walk(bl) if isinstance(fn, ast.FunctionDef) and fn.name in ("load_model",
+                                                                                             "create_model")
+                and "initialize_model" in names(fn)]
+        fills = [fn for fn in ast.walk(bl) if isinstance(fn, ast.FunctionDef) and fn.name == "load_model"
+                 and "load_weights" in names(fn)]
+        check(bool(seam) and bool(fills), "%s: the base loader builds the model with initialize_model, then "
+              "load_weights fills it" % tag)
         kv = find(parse(src, "vllm.v1.kv_cache_interface"), "KVCacheTensor")
         fields = {n.target.id for n in kv.body if isinstance(n, ast.AnnAssign)}
         check(fields == vllm_plugin.KV_TENSOR_FIELDS[shape], "%s: KVCacheTensor's fields: %r" % (tag, fields))
@@ -766,9 +920,11 @@ def case_upstream(rig):
                   "%s: V1 initialize_kv_cache_tensors calls allocate_kv_cache" % tag)
 
 
-CASES = [case_tail_plan, case_settings, case_entry_point, case_after_import, case_kv_v2, case_kv_v1_packed,
+CASES = [case_tail_plan, case_settings, case_entry_point, case_after_import, case_kv_v2, case_kv_head,
+         case_kv_v1_packed,
                   case_kv_v3_small_first,
-         case_kv_v3, case_weights, case_weights_and_kv, case_fail_open, case_blocked, case_drift, case_s2_v1,
+         case_kv_v3, case_weights, case_preplace, case_pplace_refuses, case_weights_and_kv, case_fail_open,
+         case_blocked, case_drift, case_s2_v1,
          case_s2_v3, case_upstream]
 
 
