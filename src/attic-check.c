@@ -1201,28 +1201,11 @@ int main(int argc, char **argv)
         pass = 0;
     }
     if (strcmp(mode, "heap") == 0) {
-        rc = run_child("bench", res, sizeof res);
-        pass &= rc == 0;
-        if (res[0] == '{' && res[strlen(res) - 1] == '}') {
-            res[strlen(res) - 1] = 0;
-            emit("%s,", res + 1);
-        } else {
-            emit("\"bench\":{\"pass\":false,");
-            emit_text("why", res);
-            emit("},");
-            pass = 0;
-        }
-        rc = run_child("compat", res, sizeof res);
-        pass &= rc == 0;
-        if (res[0] == '{' && res[strlen(res) - 1] == '}') {
-            res[strlen(res) - 1] = 0;
-            emit("%s,", res + 1);
-        } else {
-            emit("\"compat\":{\"pass\":false,");
-            emit_text("why", res);
-            emit("},");
-            pass = 0;
-        }
+        /* bench and compat are operator phases (--phase bench / --phase compat), never gates of a mode check: install
+         * validation must not depend on anything a stock node lacks - a live GPU microbenchmark, or the host's
+         * compat libcuda (a 0.1.3 rollout failed every mode here because the probe ran unconditionally). */
+        emit("\"bench\":{\"pass\":true,\"skipped\":\"an operator phase: attic-check --phase bench (validation checks function, not speed)\"},");
+        emit("\"compat\":{\"pass\":true,\"skipped\":\"an operator phase: attic-check --phase compat (validation must not depend on the host's libcuda)\"},");
     } else {
         emit("\"bench\":{\"pass\":true,\"skipped\":\"list mode lends no descriptors\"},");
         emit("\"compat\":{\"pass\":true,\"skipped\":\"list mode lends no descriptors\"},");

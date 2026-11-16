@@ -5,6 +5,9 @@
 # Runs a candidate atticd from CANDIDATE_DIR (rmshim.so + BUILD-INFO from attic-build.sh) on a socket of its own and
 # attic-check against it, once per mode (default "heap list"). Only when a mode passes does it install the artifact as
 # $ATTIC_LIB/artifacts/<driver>/ with a VALIDATED naming the modes that passed, and tell a running atticd (SIGHUP).
+# The modes are functional checks only: attic-check's bench and compat probes are operator phases (--phase bench,
+# --phase compat) and never run here - validation must not depend on anything a stock node lacks (a live GPU
+# microbenchmark, or the host's compat libcuda).
 # A build that failed is never enabled; its reports stay under $ATTIC_LIB/candidates/<driver>/.
 #   Exit: 0 validated, 1 every mode failed, 2 usage, 3 the node runs another driver, 4 the carveout is in use.
 #   ATTIC_BIN (atticd, attic-check; default ../bin beside this script), ATTIC_LIB (/var/lib/attic), ATTIC_RUN

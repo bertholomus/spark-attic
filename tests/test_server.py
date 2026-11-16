@@ -609,22 +609,43 @@ def case_attic_check(rig):
     rc, rep, p = run_check(rig, "heap")
     check(rc == 0 and rep and rep["pass"] is True, "attic-check passes heap on the fake: %s %s" % (p.stdout[-1500:], p.stderr[-500:]))
     ph = rep["phases"] if rep else {}
-    names = ("status", "full", "double", "isolation", "bench", "compat", "reclaim", "drain", "refusal")
+    names = ("status", "full", "double", "isolation", "reclaim", "drain", "refusal")
     check(all(ph.get(k, {}).get("pass") is True for k in names), "every phase passed: %r" % sorted(ph))
     check(ph.get("full", {}).get("size") == 254 * MIB and ph.get("full", {}).get("mismatches") == 0,
           "full: 254 MiB, every word twice, no mismatch")
+    # bench and compat are operator phases (--phase bench / --phase compat), never gates of a mode check: a stock
+    # node's validate must not depend on a live GPU microbenchmark or on the host's libcuda (the 0.1.3 rollout failed
+    # here on every A5-A8 host because the probe ran unconditionally and the real driver misreported the range).
     b = ph.get("bench", {})
-    check(b.get("size") == 64 * MIB and b.get("pages") == "2MB pages" and b.get("gathers") == 4096
+    check(b.get("pass") is True and "operator phase" in str(b.get("skipped", "")) and "--phase bench" in str(b.get("skipped", "")),
+          "heap: the bench is an operator phase, skipped in validation: %r" % (b,))
+    cm = ph.get("compat", {})
+    check(cm.get("pass") is True and "operator phase" in str(cm.get("skipped", "")) and "--phase compat" in str(cm.get("skipped", "")),
+          "heap: the compat probe is an operator phase, skipped in validation: %r" % (cm,))
+    # the refusal shape the rollout hit: a host libcuda that misreports the range cannot fail a mode check any more
+    env = dict(os.environ, LD_LIBRARY_PATH=os.path.join(rig.bin, "fakecuda"))
+    lie = dict(env, ATTIC_FAKECUDA_BADGETRANGE="1")
+    rc, rep, p = run_check(rig, "heap", extra_env=lie)
+    check(rc == 0 and rep and rep["pass"] is True
+          and "operator phase" in str(rep["phases"].get("compat", {}).get("skipped", "")),
+          "a host libcuda that lies about the va range cannot fail the heap check: rc %s %r"
+          % (rc, (rep or {}).get("phases", {}).get("compat")))
+    # the operator phases still verdict on their own when asked
+    p = subprocess.run([os.path.join(rig.bin, "attic-check"), "--phase", "bench", "--socket", rig.sock, "--key", KEY],
+                       env=env, capture_output=True, text=True, timeout=120)
+    b = json.loads(p.stdout)["bench"] if p.stdout.strip().startswith("{") else {}
+    check(p.returncode == 0 and b.get("size") == 64 * MIB and b.get("pages") == "2MB pages" and b.get("gathers") == 4096
           and b.get("granule") == 576 and all(b.get(k, 0) > 0 for k in
           ("import_read_gbs", "import_write_gbs", "plain_read_gbs", "plain_write_gbs", "import_linear_gbs",
            "plain_linear_gbs")),
-          "bench: a 64 MiB probe on both mappings, every number lands: %r" % (b,))
-    cm = ph.get("compat", {})
-    check(cm.get("size") == 16 * MIB and cm.get("memtype") == 2 and cm.get("mismatches") == 0
+          "explicit bench: a 64 MiB probe on both mappings, every number lands: %r" % (b,))
+    p = subprocess.run([os.path.join(rig.bin, "attic-check"), "--phase", "compat", "--socket", rig.sock, "--key", KEY],
+                       env=env, capture_output=True, text=True, timeout=120)
+    cm = json.loads(p.stdout)["compat"] if p.stdout.strip().startswith("{") else {}
+    check(p.returncode == 0 and cm.get("size") == 16 * MIB and cm.get("memtype") == 2 and cm.get("mismatches") == 0
           and cm.get("range_base", 0) > 0 and cm.get("range_size") == 16 * MIB and cm.get("driver_version") == 12080
           and str(cm.get("lib", "")).endswith("libcuda.so.1"),
-          "compat: a 16 MiB probe, device memory type, the true range, the loaded libcuda: %r" % (cm,))
-    env = dict(os.environ, LD_LIBRARY_PATH=os.path.join(rig.bin, "fakecuda"))
+          "explicit compat: a 16 MiB probe, device memory type, the true range, the loaded libcuda: %r" % (cm,))
     p = subprocess.run([os.path.join(rig.bin, "attic-check"), "--phase", "compat", "--socket", rig.sock, "--key", KEY],
                        env=dict(env, ATTIC_FAKECUDA_BADGETRANGE="1"), capture_output=True, text=True, timeout=120)
     cm = json.loads(p.stdout)["compat"] if p.stdout.strip().startswith("{") else {}
