@@ -9,6 +9,11 @@
  * ATTIC_FAKE_RAM=1 makes the heap hand out memory past the carveout (a heap that is not the carveout).
  * ATTIC_FAKE_EXTRA ("reserved,uefi,...") lists more carveout regions after the display one, 2 MiB each past its end:
  * reserved is display-reserved, uefi is uefi, any other word a type the shim does not know.
+ * Two time windows put RM in the state a node shows while it is still taking a dead engine's memory back (the host
+ * tests of the heap's recovery): ATTIC_FAKE_STARTSHORT=N marks every slice but one taken at open for N seconds, so
+ * atticd starts on a heap of one 2 MiB block that returns to whole later; ATTIC_FAKE_LATE=N starts N seconds at the
+ * first released block that comes free, so a client that dies leaves its slices in the heap for N seconds and the
+ * heap returns to whole after them. The clock is CLOCK_MONOTONIC; no thread runs.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -18,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <unistd.h>
@@ -33,6 +39,7 @@
 
 struct block {
     int used, ram, released; /* released: atticd let go, a process still refers to its memfd */
+    int exported;            /* a descriptor for it went to a client (probes' holds never do) */
     int mfd;                 /* the block's own memfd, open for the block's lifetime: re-exporting the slice
                               * hands out the same memory, with the previous holder's bytes still in it */
     uint64_t first, n, size;
@@ -47,7 +54,17 @@ struct attic_rm {
         uint64_t first, n;
         int fd;
     } park[8];
+    time_t late_until;      /* ATTIC_FAKE_LATE: while now < this, released blocks stay taken */
+    time_t short_until;     /* ATTIC_FAKE_STARTSHORT: while now < this, the slices below stay taken */
+    uint64_t short_from, short_to; /* the slice range that window marked (short_to excluded) */
 };
+
+/* Seconds on CLOCK_MONOTONIC (the windows must not move when the wall clock moves). */
+static time_t fake_now(void)
+{
+    struct timespec ts;
+    return clock_gettime(CLOCK_MONOTONIC, &ts) == 0 ? ts.tv_sec : time(NULL);
+}
 
 static void park(struct attic_rm *rm, struct block *b);
 static int unpark(struct attic_rm *rm, uint64_t first, uint64_t n);
@@ -112,6 +129,19 @@ static int fake_open(struct attic_rm **out, int minor, char *err, size_t n)
         rm->park[i].fd = -1;
     for (uint64_t i = 0; i < held / SLICE && i < rm->size / SLICE; i++)
         rm->taken[i] = 1;
+    /* ATTIC_FAKE_STARTSHORT: atticd starts while RM is still releasing (an engine had just exited): every slice
+     * but the last is taken for N seconds, so the bring-up measure reads one 2 MiB block and the heap returns to
+     * whole when the window ends. */
+    const char *ss = getenv("ATTIC_FAKE_STARTSHORT");
+    long short_s = ss ? atol(ss) : 0;
+    if (short_s > 0) {
+        rm->short_from = held / SLICE < rm->size / SLICE ? held / SLICE : rm->size / SLICE;
+        rm->short_to = rm->size / SLICE > 0 ? rm->size / SLICE - 1 : 0; /* the last slice stays giveable */
+        if (rm->short_from < rm->short_to) {
+            memset(rm->taken + rm->short_from, 1, rm->short_to - rm->short_from);
+            rm->short_until = fake_now() + short_s;
+        }
+    }
     *out = rm;
     return 0;
 }
@@ -186,17 +216,50 @@ static int referenced(const char *name)
     return found;
 }
 
-/* Frees the released blocks no process refers to any more. */
+/* The ATTIC_FAKE_STARTSHORT window ended: RM has taken the engine's memory back. Lift the pretend-held slices,
+ * then keep every block that is out with a holder taken (a lend made inside the window keeps its slices). */
+static void short_lift(struct attic_rm *rm)
+{
+    if (rm->short_until == 0 || fake_now() < rm->short_until)
+        return;
+    rm->short_until = 0;
+    memset(rm->taken + rm->short_from, 0, rm->short_to - rm->short_from);
+    for (int i = 0; i < MAX_HANDLES; i++)
+        if (rm->h[i].used && rm->h[i].n)
+            memset(rm->taken + rm->h[i].first, 1, rm->h[i].n);
+}
+
+/* Frees the released blocks no process refers to any more. ATTIC_FAKE_LATE: RM is slow to take a dead client's
+ * memory back - the first collect that could free a released block starts a window of N seconds in which nothing
+ * is freed, so the heap reads short for that long and returns to whole after it. */
 static void collect(struct attic_rm *rm)
 {
+    const char *late = getenv("ATTIC_FAKE_LATE");
+    time_t late_s = late ? atol(late) : 0;
+    if (late_s > 0 && rm->late_until == 0)
+        for (int i = 0; i < MAX_HANDLES && rm->late_until == 0; i++)
+            if (rm->h[i].used && rm->h[i].released && !referenced(rm->h[i].name))
+                rm->late_until = fake_now() + late_s;
+    int defer = late_s > 0 && rm->late_until != 0 && fake_now() < rm->late_until;
     for (int i = 0; i < MAX_HANDLES; i++) {
         struct block *b = &rm->h[i];
         if (b->used && b->released && !referenced(b->name)) {
+            if (defer)
+                continue; /* RM has not taken it back yet */
             memset(rm->taken + b->first, 0, b->n);
             if (b->mfd >= 0)
                 park(rm, b);
             memset(b, 0, sizeof *b);
         }
+    }
+    /* every released block that was coming free has come free: arm again for the next client that dies */
+    if (late_s > 0) {
+        int pending = 0;
+        for (int i = 0; i < MAX_HANDLES; i++)
+            if (rm->h[i].used && rm->h[i].released)
+                pending = 1;
+        if (!pending)
+            rm->late_until = 0;
     }
 }
 
@@ -221,6 +284,7 @@ static int fake_heap(struct attic_rm *rm, uint64_t size, uint32_t *handle, char 
         say(err, n, "fake: size not whole slices");
         return -EINVAL;
     }
+    short_lift(rm);
     collect(rm);
     int k = new_handle(rm, handle, err, n);
     if (k < 0)
@@ -232,14 +296,14 @@ static int fake_heap(struct attic_rm *rm, uint64_t size, uint32_t *handle, char 
             j++;
         if (j == want) {
             memset(rm->taken + i, 1, want);
-            rm->h[k] = (struct block){1, 0, 0, unpark(rm, i, want), i, want, size, ""};
+            rm->h[k] = (struct block){1, 0, 0, 0, unpark(rm, i, want), i, want, size, ""};
             snprintf(rm->h[k].name, sizeof rm->h[k].name, "attic-fake-%d-%08x", (int)getpid(), *handle);
             return 0;
         }
         i += j;
     }
     if (getenv("ATTIC_FAKE_RAM")) {
-        rm->h[k] = (struct block){1, 1, 0, -1, 0, 0, size, ""};
+        rm->h[k] = (struct block){1, 1, 0, 0, -1, 0, 0, size, ""};
         return 0;
     }
     say(err, n, "fake: NV_ERR_NO_MEMORY");
@@ -259,7 +323,7 @@ static int fake_list(struct attic_rm *rm, uint64_t base, uint64_t size, uint32_t
     int k = new_handle(rm, handle, err, n);
     if (k < 0)
         return -ENOSPC;
-    rm->h[k] = (struct block){1, 0, 0, -1, 0, 0, size, ""}; /* a list takes no heap room */
+    rm->h[k] = (struct block){1, 0, 0, 0, -1, 0, 0, size, ""}; /* a list takes no heap room */
     return 0;
 }
 
@@ -336,6 +400,7 @@ static int fake_export(struct attic_rm *rm, uint32_t handle, int *fd, char *err,
         return -errno;
     }
     *fd = d;
+    b->exported = 1;
     return 0;
 }
 
@@ -346,8 +411,13 @@ static int fake_release(struct attic_rm *rm, uint32_t handle, char *err, size_t 
         say(err, n, "fake: no handle %#x", handle);
         return -EINVAL;
     }
-    if (b->n && b->name[0] && referenced(b->name)) {
-        b->released = 1; /* RM keeps it while its memfd is open or mapped somewhere */
+    /* ATTIC_FAKE_LATE: RM is slow to take a dead client's memory back even when no process refers to it any
+     * more (RM's own bookkeeping holds the carveout): the block waits in the released state and collect()
+     * frees it when the window ends. Only a block a client really held is rerouted; the probe's internal
+     * holds and releases (never exported) keep freeing at once, or bring-up itself would stall. */
+    const char *late = getenv("ATTIC_FAKE_LATE");
+    if (b->n && b->name[0] && (referenced(b->name) || (late && atol(late) > 0 && b->exported))) {
+        b->released = 1; /* RM keeps it while its memfd is open or mapped somewhere (or the late window runs) */
         return 0;
     }
     if (b->n)

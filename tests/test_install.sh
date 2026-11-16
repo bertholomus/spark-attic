@@ -111,8 +111,8 @@ mkartifact() { # $1 = artifact dir, $2 = version: what build-release.sh lays dow
   DOCI=$HERE/release/INSTALL.md
   [ -f "$DOCI" ] || DOCI=$HERE/INSTALL.md
   cp "$DOC" "$DOCI" "$HERE/STATUS-FILE.md" "$A/share/"
-  RELEASE_NOTES=$HERE/release/RELEASE-NOTES-0.1.1.md
-  [ -f "$RELEASE_NOTES" ] || RELEASE_NOTES=$HERE/RELEASE-NOTES-0.1.1.md
+  RELEASE_NOTES=$HERE/release/RELEASE-NOTES-0.1.2.md
+  [ -f "$RELEASE_NOTES" ] || RELEASE_NOTES=$HERE/RELEASE-NOTES-0.1.2.md
   cp "$RELEASE_NOTES" "$A/share/"
   cp "$HERE/LICENSE-MIT" "$HERE/LICENSE-APACHE" "$A/share/"
   printf 'third-party notices (test)\n' >"$A/share/THIRD_PARTY_NOTICES"

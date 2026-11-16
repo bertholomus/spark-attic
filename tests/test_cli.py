@@ -61,10 +61,10 @@ def main():
 
     # ---- version
     r = run(["version"])
-    check(r.returncode == 0 and r.stdout.strip() == "%s 0.1.1" % NAME,
+    check(r.returncode == 0 and r.stdout.strip() == "%s 0.1.2" % NAME,
           "version: one line, rc 0 (%r)" % r.stdout.strip())
     r = run([])
-    check(r.returncode == 0 and "usage:" in r.stdout and "%s 0.1.1" % NAME not in r.stdout,
+    check(r.returncode == 0 and "usage:" in r.stdout and "%s 0.1.2" % NAME not in r.stdout,
           "no args: the help, not the version")
 
     # ---- status: ok
@@ -74,7 +74,7 @@ def main():
     check(r.returncode == 0 and "state     ready" in r.stdout and
           "lent      2,044 MiB" in r.stdout and "driver    999.0.1, validated" in r.stdout,
           "status ok: state, lent, driver in words")
-    check("\x1b[" not in r.stdout and r.stdout.startswith("spark-attic 0.1.1\n"),
+    check("\x1b[" not in r.stdout and r.stdout.startswith("spark-attic 0.1.2\n"),
           "status piped: no escapes, the header is the plain text line")
     r = run(["status", "--json"], root=root)
     rec = json.loads(r.stdout)
@@ -117,7 +117,7 @@ def main():
     r = run(["status"], env=env, root=os.path.join(t, "ok"))
     has_art = os.path.exists(os.path.join(share, "header-art.txt"))
     if has_art:
-        check(r.stdout.startswith("\x1b[") and "spark-attic 0.1.1" in r.stdout,
+        check(r.stdout.startswith("\x1b[") and "spark-attic 0.1.2" in r.stdout,
               "colour TTY: the header is the wordmark and the title")
         check("⣿" in r.stdout or "⢀" in r.stdout, "colour TTY: the braille wordmark is printed")
         check("\x1b[38;5;255m" in r.stdout and "\x1b[38;5;179m" in r.stdout,
@@ -126,11 +126,11 @@ def main():
               "colour TTY: the header uses the Bertholomus colours only")
     else:
         # this tree carries no art (the exported tree: the graphics gate); the plain header
-        check(r.stdout.splitlines()[0] == "spark-attic 0.1.1",
+        check(r.stdout.splitlines()[0] == "spark-attic 0.1.2",
               "colour asked, art absent: the plain text header is the first line")
         check("\x1b[" not in r.stdout, "colour asked, art absent: no escapes at all")
     r = run(["status", "--plain"], env=env, root=os.path.join(t, "ok"))
-    check(r.stdout.startswith("spark-attic 0.1.1") or "state" in r.stdout,
+    check(r.stdout.startswith("spark-attic 0.1.2") or "state" in r.stdout,
           "--plain beats ATTIC_COLOR=always")
     envn = {"ATTIC_SHARE_DIR": share, "ATTIC_COLOR": "always", "NO_COLOR": "1"}
     r = run(["status"], env=envn, root=os.path.join(t, "ok"))
@@ -139,7 +139,7 @@ def main():
     os.makedirs(empty)
     r = run(["status"], env={"ATTIC_SHARE_DIR": empty, "ATTIC_COLOR": "always"},
             root=os.path.join(t, "ok"))
-    check(r.stdout.splitlines()[0] == "spark-attic 0.1.1",
+    check(r.stdout.splitlines()[0] == "spark-attic 0.1.2",
           "colour on, art files absent: the plain text header (the exported tree's case)")
 
     # ---- doctor: fake install.sh --check feeding the preflight records

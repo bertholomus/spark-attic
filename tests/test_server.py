@@ -1120,7 +1120,66 @@ def case_silent_client(rig):
     rig.stop()
 
 
-CASES = [case_pmon_hang, case_heap_lend_and_reclaim, case_heap_drain, case_requests, case_refusals, case_export_failure, case_list_mode,
+def case_heap_client_death_recovery(rig):
+    """ATTIC-012 (a): a client lends nearly the whole heap and dies while RM is still taking the memory back
+    (ATTIC_FAKE_LATE keeps the slices out of the heap for 6 s, the journal's 02:53 shape). The mid-release
+    reading (2 MiB here) is stored honestly but must not become final: atticd keeps measuring on a bounded
+    backoff until the heap is whole again, logs that once per recovery, and lends again."""
+    rig.start(env={"ATTIC_FAKE_LATE": "6"})
+    path = os.path.join(rig.dir, "status.json")
+    check(status_file(path, lambda s: s["state"] == "ready" and s["free_mib"] == 2046, 12.0) is not None,
+          "starts whole and ready: 2046 MiB free")
+    pid, line = holder(rig.sock, 2044 * MIB)
+    check(line == "ok", "a client lends all but RM's own 2 MiB: %s" % line)
+    time.sleep(0.5)  # the lend settles into the status file before the death
+    kill(pid)
+    # lent_mib==0 tells the short reading apart from the moment before the death (the lend held free at 2 MiB
+    # too), and from the tick right after it (the numbers move before the first look stores the short cap).
+    short = lambda s: s["lent_mib"] == 0 and s["free_mib"] == 2 and s["largest_mib"] == 2
+    whole = lambda s: s["free_mib"] == 2046 and s["largest_mib"] == 2046
+    st = status_file(path, short, 8.0)
+    check(st is not None, "while RM is releasing, the heap reads short and the file says so: %r" % (st or {}))
+    st = status_file(path, whole, 90.0)
+    check(st is not None, "RM is done: the heap is back to whole with no restart: %r" % (st or {}))
+    pid2, line2 = holder(rig.sock, 2044 * MIB)
+    check(line2 == "ok", "it lends again after the recovery: %s" % line2)
+    kill(pid2)
+    st = status_file(path, short, 8.0)
+    check(st is not None, "the second death reads short again: %r" % (st or {}))
+    st = status_file(path, whole, 90.0)
+    check(st is not None, "the second client's memory comes back too: %r" % (st or {}))
+    rig.stop()
+    log = open(rig.log).read()  # after stop: atticd's log is block-buffered while it runs
+    check(log.count("display heap back to 2046 MiB free") == 2, "each recovery is logged exactly once: %r" % log[-500:])
+    check(log.count("display heap now 2 MiB free") == 2, "each short reading is announced: %r" % log[-500:])
+
+
+def case_heap_start_short_recovery(rig):
+    """ATTIC-012 (b): atticd starts while RM is still releasing an engine that just exited (ATTIC_FAKE_STARTSHORT
+    opens with every slice but one taken for 6 s). Bring-up comes up lending what there is, the short reading is
+    kept honest, and the heap is measured again until it is whole: bring-up's reading is not the reference."""
+    rig.start(env={"ATTIC_FAKE_STARTSHORT": "6"})
+    path = os.path.join(rig.dir, "status.json")
+    want = 2046 * MIB
+    st = status_file(path, lambda s: s["state"] == "ready" and s["free_mib"] == 2 and s["largest_mib"] == 2, 12.0)
+    check(st is not None, "starts on the short heap: ready with 2 MiB free: %r" % (st or {}))
+    st = status_file(path, lambda s: s["free_mib"] == 2046 and s["largest_mib"] == 2046, 90.0)
+    check(st is not None, "RM is done releasing: the heap reads whole with no restart: %r" % (st or {}))
+    log = open(rig.log).read()
+    check(log.count("display heap back to 2046 MiB free") == 1, "the recovery is logged once: %r" % log[-300:])
+    pid, line = holder(rig.sock, 2044 * MIB)
+    check(line == "ok", "it lends nearly the whole heap after the recovery: %s" % line)
+    r, fds = call(connect(rig.sock), alloc_req(4 * MIB))
+    check(r is not None and r["ok"] is False, "another alloc is refused while the memory is out: %r" % (r or {}))
+    for fd in fds:
+        os.close(fd)
+    kill(pid)
+    check(wait_free(rig.sock, want, 90.0) is not None, "given back: whole again")
+    rig.stop()
+
+
+CASES = [case_pmon_hang, case_heap_lend_and_reclaim, case_heap_client_death_recovery, case_heap_start_short_recovery,
+         case_heap_drain, case_requests, case_refusals, case_export_failure, case_list_mode,
          case_sighup, case_candidate_keep_probe, case_socket_path, case_status_file, case_display, case_display3,
          case_display4, case_display_beyond_budget, case_attic_check,
          case_region_kinds, case_silent_client]

@@ -52,7 +52,7 @@
 
 /* the version comes from the Makefile (ATTIC_VERSION); the fallback keeps a bare cc build honest */
 #ifndef ATTIC_VERSION_STR
-#define ATTIC_VERSION_STR "0.1.1"
+#define ATTIC_VERSION_STR "0.1.2"
 #endif
 #define ATTICD_VERSION ATTIC_VERSION_STR
 #define TICK_S 2
@@ -143,6 +143,14 @@ static struct {
     double probe_s;     /* how long bring-up's measure took */
     time_t settle_at;   /* the next look for drained memory back in RM's heap */
     int settle_wait;    /* seconds between looks, doubling while it stays out */
+    uint64_t heap_ref;  /* whole: st.display minus the bytes RM itself keeps. Never one measurement: a reading
+                         * taken while RM is still releasing must not become the reference (ATTIC-012). */
+    uint64_t rm_keep;   /* the bytes RM itself keeps of the carveout, as bring-up measured them, at most
+                         * HEAP_RM_KEEP_SLACK: a bring-up that ran mid-release reads far too much as "kept" */
+    time_t measure_at;  /* the next look while idle and short (0: none due) */
+    int measure_wait;   /* seconds between those looks: 2 doubling to 64 */
+    time_t short_since; /* when this episode's first short reading landed (0: not short now) */
+    int short_warned;   /* the one WARN of this episode went out */
     /* mode list */
     struct ledger ledger;
     int reserved;
@@ -530,6 +538,36 @@ static void let_go_all(struct taken *t)
 
 static int heap_probe_once(char *why, size_t n, uint64_t r); /* below */
 
+/* The idle-short backoff (ATTIC-012): a short heap is looked at again after 2 s, doubling to 64 s. */
+#define HEAP_MEASURE_MIN_S 2
+#define HEAP_MEASURE_MAX_S 64
+/* RM keeps a few MiB of the carveout for itself (2-4 MiB observed on the nodes). Bring-up's measure of that
+ * keep is trusted no further than this, so a bring-up that ran mid-release cannot push the whole-reference
+ * out of reach of a heap that is coming back. */
+#define HEAP_RM_KEEP_SLACK (16ull << 20)
+/* A heap that has read short this long gets one WARN line with the numbers, and the measuring goes on. */
+#define HEAP_SHORT_WARN_S 600
+
+/* How much of the carveout RM keeps for itself, as bring-up's measure saw it, and the reference that
+ * makes a heap "whole": the carveout size RM reports (st.display) minus that keep. The keep is never
+ * measured above HEAP_RM_KEEP_SLACK (a bring-up that runs while RM is still releasing an engine that
+ * just exited reads nearly the whole carveout as "kept"): the reference stays within reach of a whole
+ * heap, so the idle-short loop keeps looking until RM is done, and bring-up's mid-release reading is
+ * not final. On a whole bring-up the keep is exact (2-4 MiB observed), and the reference is the size
+ * a settled heap really reaches. */
+static void heap_reference(void)
+{
+    uint64_t slack = HEAP_RM_KEEP_SLACK;
+    st.rm_keep = st.display > st.cap ? st.display - st.cap : 0;
+    if (st.rm_keep > slack)
+        st.rm_keep = slack;
+    st.heap_ref = st.display > st.rm_keep ? st.display - st.rm_keep : 0;
+    st.measure_wait = 0;
+    st.measure_at = 0;
+    st.short_since = 0;
+    st.short_warned = 0;
+}
+
 static int heap_bring_up(char *why, size_t n)
 {
     uint64_t r = st.display;
@@ -543,6 +581,7 @@ static int heap_bring_up(char *why, size_t n)
             return -1;
         LOGW("the display-heap probe passed on the second look (the first read a reclaim burst)");
     }
+    heap_reference();
     return 0;
 }
 
@@ -937,21 +976,56 @@ static void heap_settle(int now)
     st.settle_at = time(NULL) + st.settle_wait;
 }
 
-/* Mode heap, idle: measure the heap again (RM's own use of it may have changed since bring-up). Not when measuring
- * is slow: a client's request would wait behind it (our client gives up after 5 s). */
+/* Mode heap, idle: measure the heap again (RM's own use of it may have changed since bring-up). A reading taken
+ * while RM is still releasing memory (a client just died, or atticd started right after an engine exited) is not
+ * final: the reference for "whole" is the carveout minus the bytes RM itself keeps (st.heap_ref), and while idle
+ * and short the heap is measured again after 2 s, doubling to 64 s, until a reading reaches the reference. Never
+ * while a client holds a lend or a drain is out, and never when measuring is slow (a client's request would wait
+ * behind it: our client gives up after 5 s). Short for a long time: one WARN, then the measuring goes on. */
 static void heap_remeasure(void)
 {
-    if (!st.up || !heap_mode() || !st.stale || st.lent || st.ndrains || st.probe_s > 1.0)
+    if (!st.up || !heap_mode() || st.lent || st.ndrains || st.probe_s > 1.0)
+        return;
+    int short_heap = st.heap_ref != 0 && st.cap < st.heap_ref;
+    if (!short_heap && !st.stale)
+        return;
+    time_t now = time(NULL);
+    if (short_heap && now < st.measure_at)
         return;
     struct taken t;
     take_all(st.display, &t);
     let_go_all(&t);
-    if (t.total != st.cap || t.largest != st.largest)
+    if (short_heap && t.total >= st.heap_ref) {
+        LOGI("display heap back to %llu MiB free (largest %llu MiB)", MiB(t.total), MiB(t.largest));
+        st.short_since = 0;
+        st.short_warned = 0;
+    } else if (t.total != st.cap || t.largest != st.largest) {
         LOGI("display heap now %llu MiB free (largest %llu MiB), was %llu (%llu)", MiB(t.total), MiB(t.largest),
              MiB(st.cap), MiB(st.largest));
+    }
     st.cap = t.total;
     st.largest = t.largest;
-    st.stale = 0;
+    if (t.total >= st.heap_ref) {
+        st.stale = 0;
+        st.measure_wait = 0;
+        st.measure_at = 0;
+        return;
+    }
+    /* Short, with nothing out: not final while idle. The status file keeps the honest numbers, and the next
+     * look waits out the backoff (2 s doubling to 64 s). */
+    st.stale = 1;
+    if (st.short_since == 0) {
+        st.short_since = now;
+    } else if (now - st.short_since >= HEAP_SHORT_WARN_S && !st.short_warned) {
+        LOGW("display heap short for %d s: %llu MiB free of a %llu MiB carveout (whole reads %llu MiB); "
+             "measuring every %d s while it lasts", (int)(now - st.short_since), MiB(t.total), MiB(st.display),
+             MiB(st.heap_ref), HEAP_MEASURE_MAX_S);
+        st.short_warned = 1;
+    }
+    st.measure_wait = st.measure_wait <= 0 ? HEAP_MEASURE_MIN_S
+                                           : st.measure_wait >= HEAP_MEASURE_MAX_S ? HEAP_MEASURE_MAX_S
+                                                                                   : st.measure_wait * 2;
+    st.measure_at = now + st.measure_wait;
 }
 
 /* ---- replies ---- */
