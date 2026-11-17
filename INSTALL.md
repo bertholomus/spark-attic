@@ -71,8 +71,8 @@ else can put anything in front of these files.
 `scripts/attic-update.sh 580.178.04 <node>` builds the shim and the tools, stages them on the node and runs step 4
 there in one go (it needs ssh to the node and `sudo -n` there). It does not install anything: do step 3 once.
 
-`release/build-release.sh 0.1.3` makes the whole release artifact instead of a hand-staged
-folder: `spark-attic-0.1.3-aarch64.tar.gz` with atticd, attic-check, the driver shims for the
+`release/build-release.sh 0.1.4` makes the whole release artifact instead of a hand-staged
+folder: `spark-attic-0.1.4-aarch64.tar.gz` with atticd, attic-check, the driver shims for the
 compatibility list, the scripts, the Python package, the unit, the docs and SHA256SUMS — the
 tarball step 3 installs. The build is reproducible (two runs, one sha256). The node needs no
 compiler and no zig either way.
@@ -82,14 +82,14 @@ compiler and no zig either way.
 One command:
 
 ```
-curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.3/install.sh | sudo bash
+curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.4/install.sh | sudo bash
 ```
 
 or, for an offline copy of the release tarball (the curl form fetches and verifies the same
 tarball from the release URL):
 
 ```
-install.sh --from spark-attic-0.1.3-aarch64.tar.gz
+install.sh --from spark-attic-0.1.4-aarch64.tar.gz
 ```
 
 What it does, in order:

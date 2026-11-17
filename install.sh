@@ -28,7 +28,7 @@ set -uo pipefail
 
 NAME=spark-attic
 HERE=$(cd "$(dirname "$0")" && pwd)
-VERSION=${INSTALL_VERSION:-0.1.3}   # build-release.sh stamps the release version here
+VERSION=${INSTALL_VERSION:-0.1.4}   # build-release.sh stamps the release version here
 URL_BASE=${ATTIC_URL_BASE:-https://github.com/bertholomus/spark-attic/releases/download}
 SYSCTL_NAME=99-spark-attic-minfree.conf
 CHECK=0; JSON=0; PLAIN=0; WITH_SYSCTL=0; NO_SYSCTL=0; DEMO=0; FAIL_STEP=""
@@ -274,7 +274,7 @@ preflight_run() {
     fi
   elif [ "${ATTIC_TEST:-0}" = 1 ]; then
     pre_record libcuda pass "the host test's fake node: no driver library expected here"
-  elif ldconfig -p 2>/dev/null | grep -q "libcuda\.so\.1"; then
+  elif [ "$(ldconfig -p 2>/dev/null | grep -c "libcuda\.so\.1")" -ge 1 ]; then
     pre_record libcuda pass "the driver library is there (libcuda.so.1)"
   else
     pre_record libcuda fail "no libcuda.so.1 on this host: attic-check and the daemon cannot load the NVIDIA driver" \
@@ -562,11 +562,11 @@ install_files() {
     log "removed an old attic-check from /usr/local/bin (the manual path now matches the installer)"
   fi
   for f in header-art.txt header-col.txt README.md INSTALL.md STATUS-FILE.md \
-           RELEASE-NOTES-0.1.3.md THIRD_PARTY_NOTICES LICENSE-MIT LICENSE-APACHE; do
+           RELEASE-NOTES-0.1.4.md THIRD_PARTY_NOTICES LICENSE-MIT LICENSE-APACHE; do
     # the art files are optional (the release's art gate may leave them out); the rest are not
     [ -f "$ART/$(art_share)/$f" ] && install -m 644 "$ART/$(art_share)/$f" "$R/usr/local/share/$NAME/$f"
   done
-  for f in README.md INSTALL.md STATUS-FILE.md RELEASE-NOTES-0.1.3.md \
+  for f in README.md INSTALL.md STATUS-FILE.md RELEASE-NOTES-0.1.4.md \
            THIRD_PARTY_NOTICES LICENSE-MIT LICENSE-APACHE; do
     [ -f "$R/usr/local/share/$NAME/$f" ] ||
       { say "the artifact is missing share/$f: refusing"; return 1; }
@@ -708,7 +708,7 @@ FAKE
   [ -f "$HERE/share/$NAME/header-art.txt" ] &&
     cp "$HERE/share/$NAME/header-art.txt" "$HERE/share/$NAME/header-col.txt" "$A/share/"
   # the docs: the working tree keeps them under release/, the exported tree at its root
-  for doc in README.md INSTALL.md RELEASE-NOTES-0.1.3.md; do
+  for doc in README.md INSTALL.md RELEASE-NOTES-0.1.4.md; do
     [ -f "$HERE/release/$doc" ] && cp "$HERE/release/$doc" "$A/share/"
     [ -f "$HERE/$doc" ] && cp "$HERE/$doc" "$A/share/"
   done
@@ -835,7 +835,7 @@ files_identical() { # is what is installed byte-equal to this artifact?
     "usr/local/bin/$NAME:bin/spark-attic" \
     "usr/local/share/$NAME/header-art.txt:$AS/header-art.txt" \
     "usr/local/share/$NAME/header-col.txt:$AS/header-col.txt" \
-    "usr/local/share/$NAME/RELEASE-NOTES-0.1.3.md:$AS/RELEASE-NOTES-0.1.3.md" \
+    "usr/local/share/$NAME/RELEASE-NOTES-0.1.4.md:$AS/RELEASE-NOTES-0.1.4.md" \
     "usr/local/share/$NAME/README.md:$AS/README.md" \
     "usr/local/share/$NAME/INSTALL.md:$AS/INSTALL.md" \
     "usr/local/share/$NAME/STATUS-FILE.md:$AS/STATUS-FILE.md" \
