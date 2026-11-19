@@ -6,7 +6,7 @@
 CC ?= cc
 OUT ?= build/host
 # the one place the version is written; build-release.sh overrides it with its argument
-ATTIC_VERSION ?= 0.1.5
+ATTIC_VERSION ?= 0.1.6
 CFLAGS ?= -std=gnu11 -O2 -g -Wall -Wextra -Wformat=2 -Wno-format-nonliteral -fstack-protector-strong -D_FORTIFY_SOURCE=2
 CFLAGS += -DATTIC_VERSION_STR='"$(ATTIC_VERSION)"'
 # The release build maps the build tree's and the zig toolchain's paths out of the debug info:

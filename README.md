@@ -73,7 +73,7 @@ Clients speak one small protocol over a Unix socket (`/run/spark-attic/attic.soc
 `/etc/spark-attic/key`). A keyless status file, `/run/spark-attic/status.json`, tells dashboards what is lent
 ([STATUS-FILE.md](STATUS-FILE.md)).
 
-A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.5: it has never
+A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.6: it has never
 passed a node check (on 580.178.04 RM uses part of the region, so the check refuses list mode there), and atticd
 will not run in it until a driver validates it.
 
@@ -106,7 +106,7 @@ boot, and KV pool sizes come from each engine's own log.
 
 **TensorFold, Qwen3.8 Flash Next** (bf16 KV, text only, a 262,144-token window, up to 5 streams). TensorFold `main`
 8db1ee1a with two of our patches, open upstream as TensorFold #2762 and #2763 and in no TensorFold release
-yet (the current release, 1.2.7, has neither): the carveout source `TF_CUDA_CARVEOUT_SOURCE=attic`
+yet (the current release, 1.2.7, has neither): the carveout source (now `TF_CUDA_CARVEOUT_SOURCE=daemon`)
 and Flash Next's KV cache in the carveout. Replies: 8 prompts at temperature 0 and 3 seeded at temperature 1.0,
 compared by text, finish reason and token hash. Speeds in tokens per second: decode the median of 5 runs, prefill the
 best of 3.
@@ -168,10 +168,11 @@ default because it adds the whole carveout. The script that made this table is `
 
 ## Quick start
 
-One command on the node, as root (INSTALL.md has the details, and the manual path):
+One command on the node, as root (INSTALL.md has the details, and the manual path). If a coding agent installs it for
+you, point the agent at [AGENTS.md](AGENTS.md): it has the install procedure and the rules an agent follows.
 
 ```
-curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.5/install.sh | sudo bash
+curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.6/install.sh | sudo bash
 ```
 
 The installer checks the node first (aarch64 GB10, root, systemd, the driver, a shim for that

@@ -52,7 +52,7 @@
 
 /* the version comes from the Makefile (ATTIC_VERSION); the fallback keeps a bare cc build honest */
 #ifndef ATTIC_VERSION_STR
-#define ATTIC_VERSION_STR "0.1.5"
+#define ATTIC_VERSION_STR "0.1.6"
 #endif
 #define ATTICD_VERSION ATTIC_VERSION_STR
 #define TICK_S 2

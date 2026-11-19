@@ -72,8 +72,8 @@ else can put anything in front of these files.
 `scripts/attic-update.sh 580.178.04 <node>` builds the shim and the tools, stages them on the node and runs step 4
 there in one go (it needs ssh to the node and `sudo -n` there). It does not install anything: do step 3 once.
 
-`release/build-release.sh 0.1.5` makes the whole release artifact instead of a hand-staged
-folder: `spark-attic-0.1.5-aarch64.tar.gz` with atticd, attic-check, the driver shims for the
+`release/build-release.sh 0.1.6` makes the whole release artifact instead of a hand-staged
+folder: `spark-attic-0.1.6-aarch64.tar.gz` with atticd, attic-check, the driver shims for the
 compatibility list, the scripts, the Python package, the unit, the docs and SHA256SUMS — the
 tarball step 3 installs. The build is reproducible (two runs, one sha256). The node needs no
 compiler and no zig either way.
@@ -83,14 +83,14 @@ compiler and no zig either way.
 One command:
 
 ```
-curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.5/install.sh | sudo bash
+curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.6/install.sh | sudo bash
 ```
 
 or, for an offline copy of the release tarball (the curl form fetches and verifies the same
 tarball from the release URL):
 
 ```
-install.sh --from spark-attic-0.1.5-aarch64.tar.gz
+install.sh --from spark-attic-0.1.6-aarch64.tar.gz
 ```
 
 What it does, in order:
@@ -234,10 +234,12 @@ that group (`chgrp <group> /etc/spark-attic/key; chmod 0640 /etc/spark-attic/key
 On kernels with 64 KiB pages, vLLM 0.24.0's default lazy safetensors load can stall; add
 `--safetensors-load-strategy eager` to `vllm serve`. This is vLLM's, with or without spark-attic.
 
-**TensorFold.** The carveout source proposed to TensorFold (not in a TensorFold release yet) borrows from atticd with
-`TF_CUDA_CARVEOUT=1 TF_CUDA_CARVEOUT_SOURCE=attic`, `TENSORFOLD_ATTIC_SOCK=/run/spark-attic/attic.sock` (its default)
-and `TENSORFOLD_ATTIC_KEY` set to the key (else it reads `/etc/spark-attic/key`). In a container, mount
-`/run/spark-attic` and the key as above.
+**TensorFold.** The carveout source proposed to TensorFold (#2762, with Flash Next's KV in the carveout in #2763; not
+in a TensorFold release yet, so build TensorFold from that branch) borrows from atticd with `TF_CUDA_CARVEOUT=1
+TF_CUDA_CARVEOUT_SOURCE=daemon TF_CUDA_CARVEOUT_SOCKET=/run/spark-attic/attic.sock
+TF_CUDA_CARVEOUT_KEY_FILE=/etc/spark-attic/key TF_CUDA_CARVEOUT_MIB=2044` (the socket's default is another lender's,
+so name atticd's). It needs neither `nvidia_drm modeset=1` nor `/dev/dri`. Flash Next takes the carveout at one rank
+only. In a container, mount `/run/spark-attic` and the key as above.
 
 **Anything else.** `python/spark_attic` (`spark_attic.borrow()`) or the protocol in README.md.
 
