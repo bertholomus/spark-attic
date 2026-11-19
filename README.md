@@ -98,6 +98,14 @@ fail loudly about. |
 
 Where a plugin does not know the layout, it stays off and the engine runs exactly as without it, with one log line.
 
+**Community validation: Acer Veriton GN100.** Two headless Acer Veriton GN100 / NVIDIA GB10 nodes ran
+spark-attic v0.1.6 in heap mode on Ubuntu 24.04.5, kernel `7.0.0-1019-nvidia`, 4 KiB pages and NVIDIA driver
+`580.178.04`. Full CUDA buffer validation wrote and read 2,143,289,344 bytes (2,044 MiB) on each node with
+zero mismatches. Exclusive lending, slice isolation, holder-death reclamation, draining and
+malformed/authentication request refusal also passed. This [community field
+report](https://github.com/bertholomus/spark-attic/issues/3) establishes buffer-validation results for that
+configuration; the engine benchmarks below remain the ASUS Ascent GX10 runs.
+
 ## Measured on stock DGX OS
 
 ASUS Ascent GX10, DGX OS 7.6.0 (Ubuntu 24.04.5) with kernel 7.0.0-1024-nvidia-64k, driver 580.178.04, spark-attic
