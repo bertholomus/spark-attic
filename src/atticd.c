@@ -52,7 +52,7 @@
 
 /* the version comes from the Makefile (ATTIC_VERSION); the fallback keeps a bare cc build honest */
 #ifndef ATTIC_VERSION_STR
-#define ATTIC_VERSION_STR "0.1.4"
+#define ATTIC_VERSION_STR "0.1.5"
 #endif
 #define ATTICD_VERSION ATTIC_VERSION_STR
 #define TICK_S 2
@@ -345,9 +345,61 @@ static int graphics_process(char *who, size_t n)
     return 0;
 }
 
+/* A firmware console's connector is not a display. Ubuntu keeps the UEFI boot framebuffer as a DRM card (simpledrm;
+ * efidrm, vesadrm or ofdrm on other kernels and boards) whose one virtual connector, card<N>-Unknown-<M>, always reads
+ * "connected", on a headless box too; stock DGX OS has no such card. That card scans out of the framebuffer the firmware
+ * set up, not out of RM's display heap: it never takes a block of the carveout, so it neither races a lend nor stops
+ * being "connected". Its card is known by its device or that device's driver (cardN/device, cardN/device/driver); a
+ * card whose links cannot be read still counts (fail closed). Bring-up separately proves the firmware framebuffer lies
+ * outside the display carveout (firmware_fb_clear). 1 skip it (drv names the device or driver), 0 it counts. */
+static int firmware_console(const char *connector, char *drv, size_t n)
+{
+    const char *dash = strchr(connector, '-');
+    if (dash == NULL)
+        return 0;
+    static const char *const leaf[] = {"device/driver", "device"};
+    for (int i = 0; i < 2; i++) {
+        char path[PATH_MAX], link[PATH_MAX];
+        if (snprintf(path, sizeof path, "%s/%.*s/%s", cfg.drm_dir, (int)(dash - connector), connector, leaf[i]) >=
+            (int)sizeof path)
+            continue;
+        ssize_t len = readlink(path, link, sizeof link - 1);
+        if (len <= 0)
+            continue;
+        link[len] = 0;
+        const char *base = strrchr(link, '/');
+        base = base ? base + 1 : link;
+        if (attic_firmware_fb_name(base)) {
+            snprintf(drv, n, "%.100s", base);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The first firmware console connector in the DRM tree, whatever its status: 1 found (name, drv filled), 0 none. */
+static int firmware_console_present(char *name, size_t n, char *drv, size_t dn)
+{
+    DIR *d = opendir(cfg.drm_dir);
+    if (d == NULL)
+        return 0;
+    struct dirent *e;
+    int found = 0;
+    while (!found && (e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "card", 4) != 0 || strchr(e->d_name, '-') == NULL)
+            continue;
+        if (firmware_console(e->d_name, drv, dn)) {
+            snprintf(name, n, "%s", e->d_name);
+            found = 1;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
 /* A display in use, by any of the three signals: (a) a process other than
  * nvidia-persistenced holds /dev/nvidia-modeset, (b) the GPU lists a graphics (type G) process, (c) a
- * DRM connector reports "connected" (the KMS systems; on stock DGX OS with nvidia-drm modeset=0 there
+ * DRM connector other than a firmware console's reports "connected" (the KMS systems; on stock DGX OS with nvidia-drm modeset=0 there
  * are no connector dirs at all, so (a) and (b) carry the verdict there). atticd lends RM's free display
  * heap, so a display that may light up and lending do not mix: bring-up refuses, and a display coming
  * into use while lending stops new lends at once. No signal firing (a headless box, an idle desktop
@@ -383,6 +435,9 @@ static int display_in_use(char *name, size_t n, int complete)
     while (!found && (e = readdir(d)) != NULL) {
         if (strncmp(e->d_name, "card", 4) != 0 || strchr(e->d_name, '-') == NULL)
             continue; /* connectors are card<N>-<CONNECTOR>; the card itself has no status */
+        char drv[128];
+        if (firmware_console(e->d_name, drv, sizeof drv))
+            continue; /* the firmware console's virtual connector always reads connected; it is not a display */
         char path[PATH_MAX], status[64];
         size_t len;
         if (snprintf(path, sizeof path, "%s/%s/status", cfg.drm_dir, e->d_name) >= (int)sizeof path)
@@ -718,6 +773,33 @@ static const char *kind_name(uint32_t k)
     }
 }
 
+/* With a firmware console on the box, lend only when its framebuffer is provably outside every display region: a
+ * console that writes into the carveout would write into lent slices. 0 clear (or no firmware console), -1 refuse. */
+static int firmware_fb_clear(char *why, size_t n)
+{
+    char con[256], drv[128];
+    if (!firmware_console_present(con, sizeof con, drv, sizeof drv))
+        return 0;
+    for (int i = 0; i < st.nregions; i++) {
+        if (st.regions[i].kind != ATTIC_REGION_DISPLAY)
+            continue;
+        char w[256];
+        int r = attic_iomem_touches_firmware_fb(cfg.iomem, st.regions[i].base, st.regions[i].size, w, sizeof w);
+        if (r == 1) {
+            say(why, n, "the firmware console %s (%s) scans out of the display carveout: its framebuffer %s lies in "
+                "display region %#" PRIx64 "+%llu MiB", con, drv, w, st.regions[i].base, MiB(st.regions[i].size));
+            return -1;
+        }
+        if (r != 0) {
+            say(why, n, "a firmware console %s (%s) is present and its framebuffer cannot be placed: %s", con, drv, w);
+            return -1;
+        }
+    }
+    LOGI("firmware console %s (%s): its framebuffer lies outside the display carveout, so it is not a display "
+         "atticd lends against", con, drv);
+    return 0;
+}
+
 static void bring_up(void)
 {
     char why[512] = "";
@@ -790,6 +872,8 @@ static void bring_up(void)
         say(why, sizeof why, "RM reports no display carveout on this GPU");
         goto refuse;
     }
+    if (firmware_fb_clear(why, sizeof why) != 0)
+        goto refuse;
     char conn[256];
     if (display_in_use(conn, sizeof conn, 1) > 0) {
         st.display_block = 1;
@@ -1580,6 +1664,12 @@ static int probe_display_run(void)
         while (!c && (e = readdir(d)) != NULL) {
             if (strncmp(e->d_name, "card", 4) != 0 || strchr(e->d_name, '-') == NULL)
                 continue;
+            char drv[128];
+            if (firmware_console(e->d_name, drv, sizeof drv)) {
+                printf("skip drm-connector: %s is the firmware console (%s), not a display; bring-up checks its "
+                       "framebuffer lies outside the display carveout\n", e->d_name, drv);
+                continue;
+            }
             char path[PATH_MAX], status[64];
             size_t len;
             if (snprintf(path, sizeof path, "%s/%s/status", cfg.drm_dir, e->d_name) >= (int)sizeof path)

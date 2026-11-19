@@ -11,7 +11,12 @@ gets about 2 GiB more without giving up any other memory.
 consults the verdict without scanning anything. A display is in use when any of these holds: a process other
 than `nvidia-persistenced` holds `/dev/nvidia-modeset`; the GPU lists a graphics (type G) process; a DRM
 connector reports `connected` (that last one is the KMS systems; stock DGX OS runs with `nvidia-drm modeset=0`
-and has no connector state at all, so the first two carry the verdict there). `nvidia-persistenced` holding
+and has no connector state at all, so the first two carry the verdict there). The firmware console is not a
+display: Ubuntu keeps the UEFI boot framebuffer as a DRM card (simpledrm) whose virtual connector, `card0-Unknown-1`,
+always reads `connected`, so a connector on a card bound to a firmware framebuffer device or driver
+(`simple-framebuffer`, `simpledrm`, `efidrm`, `vesadrm`, `ofdrm`) is skipped. That console scans out of the
+firmware's framebuffer, not out of RM's display heap, and bring-up lends beside it only after `/proc/iomem` shows its
+framebuffer outside the display carveout (on a GB10 it sits in the separate UEFI region). `nvidia-persistenced` holding
 the device open is the idle state - it keeps the driver loaded, it does not light anything up. The verdict is
 held, not re-derived from each tick's own instant: the signals are read on their own cadence (the modeset
 scan walks at most 256 process dirs a tick, the pmon sample runs every 30 s), so once a display is seen in
@@ -68,7 +73,7 @@ Clients speak one small protocol over a Unix socket (`/run/spark-attic/attic.soc
 `/etc/spark-attic/key`). A keyless status file, `/run/spark-attic/status.json`, tells dashboards what is lent
 ([STATUS-FILE.md](STATUS-FILE.md)).
 
-A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.4: it has never
+A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.5: it has never
 passed a node check (on 580.178.04 RM uses part of the region, so the check refuses list mode there), and atticd
 will not run in it until a driver validates it.
 
@@ -166,7 +171,7 @@ default because it adds the whole carveout. The script that made this table is `
 One command on the node, as root (INSTALL.md has the details, and the manual path):
 
 ```
-curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.4/install.sh | sudo bash
+curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.5/install.sh | sudo bash
 ```
 
 The installer checks the node first (aarch64 GB10, root, systemd, the driver, a shim for that

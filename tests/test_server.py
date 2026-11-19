@@ -889,6 +889,89 @@ def case_display3(rig):
     rig.stop()
 
 
+def fw_drm(rig, nvidia_status=None, fw_links=True):
+    """A Ubuntu-shaped DRM tree: card0 is the firmware console (simpledrm on simple-framebuffer.0) with its one virtual
+    connector card0-Unknown-1 always "connected"; card1 is the NVIDIA GPU with connector card1-DP-1 when nvidia_status
+    is given. fw_links=False leaves card0's device links out (unreadable: the connector must count)."""
+    d = drm(rig, dict({"card0-Unknown-1": "connected"}, **({"card1-DP-1": nvidia_status} if nvidia_status else {})))
+    devs = os.path.join(rig.dir, "devices")
+    shutil.rmtree(devs, ignore_errors=True)
+    for card, dev, drv in ((("card0", "simple-framebuffer.0", "simple-framebuffer"),) if fw_links else ()) + (
+            ("card1", "000f:01:00.0", "nvidia"),):
+        os.makedirs(os.path.join(devs, dev), exist_ok=True)
+        os.makedirs(os.path.join(devs, "drivers", drv), exist_ok=True)
+        os.symlink(os.path.join(devs, "drivers", drv), os.path.join(devs, dev, "driver"))
+        os.makedirs(os.path.join(d, card), exist_ok=True)
+        os.symlink(os.path.join(devs, dev), os.path.join(d, card, "device"))
+    return d
+
+
+def case_firmware_console(rig):
+    """Ubuntu exposes the UEFI boot framebuffer as a DRM card (simpledrm) whose virtual connector always reads
+    "connected", on a headless node too: it is not a display, so the probe and the daemon skip it and lend, as long as
+    its framebuffer lies outside the display carveout; a framebuffer inside it, or one that cannot be placed, refuses.
+    The NVIDIA card's own connectors still count, and a card whose links cannot be read counts (fail closed)."""
+    idle = ("--modeset-dir", modeset_holders(rig, None), "--pmon-file", pmon_file(rig, None))
+    real_iomem = open(rig.iomem).read()
+    outside = "80000000-27fffffff : System RAM\n280000000-2ffffffff : reserved\n300000000-302ffffff : BOOTFB\n" \
+              "  300000000-302ffffff : simple-framebuffer.0\n303000000-1fffffffff : System RAM\n"
+    try:
+        with open(rig.iomem, "w") as f:
+            f.write(outside)
+        d = fw_drm(rig)
+        p = subprocess.run(rig.args("--probe-display", *idle, "--drm-dir", d), capture_output=True, text=True)
+        lines = p.stdout.splitlines()
+        check(p.returncode == 0 and any(l.startswith("skip drm-connector: card0-Unknown-1 is the firmware console "
+                                                     "(simple-framebuffer)") for l in lines)
+              and lines[-1].startswith("idle:"), "--probe-display: the firmware console is skipped, idle: %r" % lines)
+        rig.start(*idle, "--drm-dir", d)
+        st = ask(rig.sock, '{"key":"%s","op":"status"}' % KEY)
+        check(st["state"] == "ready" and st["size"] == 2046 * MIB,
+              "a firmware console beside the carveout: lends (%r)" % st["why"])
+        check("firmware console card0-Unknown-1 (simple-framebuffer): its framebuffer lies outside" in open(rig.log).read(),
+              "the skip is logged with its proof")
+        rig.stop()
+
+        # the NVIDIA card's connector still counts
+        d = fw_drm(rig, "connected")
+        p = subprocess.run(rig.args("--probe-display", *idle, "--drm-dir", d), capture_output=True, text=True)
+        check(p.returncode == 1 and "IN-USE drm-connector: card1-DP-1 reports connected" in p.stdout,
+              "--probe-display: a connected NVIDIA connector is still in use: %r" % p.stdout.splitlines())
+        rig.start(*idle, "--drm-dir", d)
+        st = ask(rig.sock, '{"key":"%s","op":"status"}' % KEY)
+        check(st["state"] == "refusing" and "card1-DP-1" in st["why"], "and the daemon refuses on it (%r)" % st["why"])
+        rig.stop()
+
+        # a card whose device links cannot be read is not known to be a firmware console: it counts
+        d = fw_drm(rig, fw_links=False)
+        p = subprocess.run(rig.args("--probe-display", *idle, "--drm-dir", d), capture_output=True, text=True)
+        check(p.returncode == 1 and "IN-USE drm-connector: card0-Unknown-1" in p.stdout,
+              "unreadable card links: the connector counts: %r" % p.stdout.splitlines())
+
+        # the firmware framebuffer inside the display carveout: refuse, never lend into what the console writes
+        with open(rig.iomem, "w") as f:
+            f.write("80000000-27fffffff : System RAM\n280000000-2ffffffff : reserved\n"
+                    "  2f0000000-2f2ffffff : BOOTFB\n300000000-1fffffffff : System RAM\n")
+        d = fw_drm(rig)
+        rig.start(*idle, "--drm-dir", d)
+        st = ask(rig.sock, '{"key":"%s","op":"status"}' % KEY)
+        check(st["state"] == "refusing" and "scans out of the display carveout" in st["why"] and "BOOTFB" in st["why"],
+              "a firmware framebuffer inside the carveout: refusing (%r)" % st["why"])
+        rig.stop()
+
+        # what a non-root reader sees: the framebuffer cannot be placed, so nothing is lent beside the console
+        with open(rig.iomem, "w") as f:
+            f.write("00000000-00000000 : System RAM\n00000000-00000000 : BOOTFB\n")
+        rig.start(*idle, "--drm-dir", d)
+        st = ask(rig.sock, '{"key":"%s","op":"status"}' % KEY)
+        check(st["state"] == "refusing" and "cannot be placed" in st["why"],
+              "a firmware console whose framebuffer cannot be placed: refusing (%r)" % st["why"])
+        rig.stop()
+    finally:
+        with open(rig.iomem, "w") as f:
+            f.write(real_iomem)
+
+
 def case_display4(rig):
     """The display verdict is held across ticks, not re-derived from one instant. On a
     real GB10 desktop the samples are sparser than the 2 s tick (the 256-pid modeset pass finds the holder
@@ -1311,7 +1394,7 @@ CASES = [case_pmon_hang, case_heap_lend_and_reclaim, case_heap_client_death_reco
          case_heap_drain, case_requests, case_refusals, case_export_failure, case_list_mode,
          case_sighup, case_candidate_keep_probe, case_socket_path, case_status_file, case_display, case_display3,
          case_display4, case_scanout_lend, case_display_beyond_budget, case_attic_check, case_pages_reported,
-         case_region_kinds, case_silent_client]
+         case_region_kinds, case_silent_client, case_firmware_console]
 
 
 def main():

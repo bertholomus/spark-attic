@@ -222,6 +222,24 @@ static void test_files(void)
     snprintf(p, sizeof p, "%s/iomem0", dir);
     CHECK(attic_iomem_touches_ram(p, 0x280000000ull, 0x80000000ull, why, sizeof why) == -1);
 
+    /* the firmware console's boot framebuffer: GB10's UEFI region sits right after the display region */
+    write_file("iomemfb", "80000000-27fffffff : System RAM\n280200000-2ffffffff : reserved\n"
+                          "300000000-302ffffff : BOOTFB\n  300000000-302ffffff : simple-framebuffer.0\n");
+    snprintf(p, sizeof p, "%s/iomemfb", dir);
+    CHECK(attic_iomem_touches_firmware_fb(p, 0x280200000ull, 2046ull << 20, why, sizeof why) == 0);
+    CHECK(attic_iomem_touches_firmware_fb(p, 0x280200000ull, (2046ull << 20) + 0x200000, why, sizeof why) == 1 &&
+          strstr(why, "BOOTFB") != NULL);
+    CHECK(attic_iomem_touches_firmware_fb(p, 0x302e00000ull, 0x400000ull, why, sizeof why) == 1);
+    snprintf(p, sizeof p, "%s/iomem", dir); /* no firmware framebuffer at all */
+    CHECK(attic_iomem_touches_firmware_fb(p, 0x280000000ull, 0x80000000ull, why, sizeof why) == 0);
+    write_file("iomemfb0", "00000000-00000000 : reserved\n00000000-00000000 : BOOTFB\n"); /* non-root */
+    snprintf(p, sizeof p, "%s/iomemfb0", dir);
+    CHECK(attic_iomem_touches_firmware_fb(p, 0x280000000ull, 0x80000000ull, why, sizeof why) == -1);
+    CHECK(attic_firmware_fb_name("simple-framebuffer") && attic_firmware_fb_name("simple-framebuffer.0") &&
+          attic_firmware_fb_name("simpledrm") && attic_firmware_fb_name("efidrm") && attic_firmware_fb_name("BOOTFB"));
+    CHECK(!attic_firmware_fb_name("nvidia") && !attic_firmware_fb_name("000f:01:00.0") &&
+          !attic_firmware_fb_name("simpledrmx") && !attic_firmware_fb_name("efi"));
+
     write_file("meminfo", "MemTotal:       129798784 kB\nMemFree:         1048576 kB\n");
     snprintf(p, sizeof p, "%s/meminfo", dir);
     CHECK(attic_mem_free(p) == 1073741824ull);

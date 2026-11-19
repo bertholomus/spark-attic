@@ -131,6 +131,58 @@ int attic_iomem_touches_ram(const char *path, uint64_t base, uint64_t size, char
     return 0;
 }
 
+/* The firmware's boot framebuffer under its Linux names: the iomem range sysfb registers (BOOTFB), the platform devices
+ * (simple-framebuffer.N, efi-framebuffer.N, vesa-framebuffer.N) and the drivers that take them over as a DRM card or an
+ * fbdev. A device instance's ".N" suffix counts as the same name. */
+static const char *const FIRMWARE_FB[] = {"BOOTFB", "simple-framebuffer", "simpledrm", "efi-framebuffer", "efifb",
+                                          "efidrm", "vesa-framebuffer", "vesafb", "vesadrm", "ofdrm", NULL};
+
+int attic_firmware_fb_name(const char *name)
+{
+    for (int i = 0; FIRMWARE_FB[i]; i++) {
+        size_t k = strlen(FIRMWARE_FB[i]);
+        if (strncmp(name, FIRMWARE_FB[i], k) == 0 && (name[k] == 0 || name[k] == '.'))
+            return 1;
+    }
+    return 0;
+}
+
+int attic_iomem_touches_firmware_fb(const char *path, uint64_t base, uint64_t size, char *why, size_t n)
+{
+    FILE *f = fopen(path, "re");
+    if (f == NULL) {
+        snprintf(why, n, "cannot read %s: %s", path, strerror(errno));
+        return -1;
+    }
+    char line[256];
+    int ranges = 0, nonzero = 0, touches = 0;
+    uint64_t end = base + size; /* exclusive */
+    while (fgets(line, sizeof line, f)) {
+        uint64_t lo, hi;
+        char name[160];
+        if (sscanf(line, " %" SCNx64 "-%" SCNx64 " : %159[^\n]", &lo, &hi, name) != 3)
+            continue;
+        ranges++;
+        if (lo || hi)
+            nonzero = 1;
+        if (!attic_firmware_fb_name(name))
+            continue;
+        if ((lo || hi) && lo < end && base <= hi) {
+            snprintf(why, n, "%#" PRIx64 "-%#" PRIx64 " (%s)", lo, hi, name);
+            touches = 1;
+            break;
+        }
+    }
+    fclose(f);
+    if (touches)
+        return 1;
+    if (ranges == 0 || !nonzero) {
+        snprintf(why, n, "%s shows no addresses (needs root)", path);
+        return -1;
+    }
+    return 0;
+}
+
 uint64_t attic_mem_free(const char *path)
 {
     char buf[8192];

@@ -33,6 +33,14 @@ int attic_driver_version(const char *path, char *out, size_t cap);
  * unreadable or shows no addresses (only root sees them). */
 int attic_iomem_touches_ram(const char *path, uint64_t base, uint64_t size, char *why, size_t n);
 
+/* Whether [base, base+size) touches a firmware framebuffer range of an iomem file (BOOTFB, or a range a firmware
+ * framebuffer driver claims: simple-framebuffer, simpledrm, efifb, efidrm, vesafb, vesadrm, ofdrm): 1 it does (why names
+ * the range), 0 it does not, -1 the file is unreadable or shows no addresses (only root sees them). */
+int attic_iomem_touches_firmware_fb(const char *path, uint64_t base, uint64_t size, char *why, size_t n);
+
+/* Whether a name is a firmware framebuffer's (a device, driver or iomem name above; "simple-framebuffer.0" counts). */
+int attic_firmware_fb_name(const char *name);
+
 /* MemFree from a meminfo file, in bytes; 0 when unreadable. */
 uint64_t attic_mem_free(const char *path);
 
