@@ -176,6 +176,15 @@ Only a mode that passes is enabled: the shim is installed as `/var/lib/attic/art
 list is refused (the driver uses part of the region), so the exit code is 0 with `modes=heap`. If no mode passes,
 nothing is enabled (exit 1) and the reports stay in `/var/lib/attic/candidates/580.178.04/`.
 
+**Boot readiness.** System-wide `MemFree` movement can reject validation even with zero CUDA data mismatches.
+In the [Acer GN100 field report](https://github.com/bertholomus/spark-attic/issues/3), one node's boot-time
+check had zero mismatches, but `MemFree` fell 568 MiB, exceeding the 511 MiB quarter-slice limit. Early-boot
+memory activity was the working explanation, not a proven root cause. After local scheduling waited for boot
+activity to settle, a later paired reboot passed full validation on both nodes with zero mismatches and drops
+of 127 and 148 MiB. Keep the conservative threshold and refusal, retain failed reports and investigate before
+a justified repeat when conditions have changed. Do not automatically loop until validation passes. The
+readiness wait was local orchestration, not an upstream service feature.
+
 ## 5. Start
 
 ```
