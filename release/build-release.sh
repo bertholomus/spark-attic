@@ -93,7 +93,7 @@ for _di in "$STAGE"/python/spark_attic-[0-9]*.dist-info; do
 done
 sed -i "s/^Version: .*/Version: $V/" "$STAGE/python/spark_attic-$V.dist-info/METADATA"
 # the docs: the working tree keeps them under release/, the exported tree at its root
-for f in README.md INSTALL.md RELEASE-NOTES-0.1.6.md; do
+for f in README.md INSTALL.md RELEASE-NOTES-0.1.7.md; do
   src=$HERE/release/$f
   [ -f "$src" ] || src=$HERE/$f
   [ -f "$src" ] && cp "$src" "$STAGE/share/spark-attic/$f"

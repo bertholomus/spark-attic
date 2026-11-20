@@ -73,7 +73,7 @@ Clients speak one small protocol over a Unix socket (`/run/spark-attic/attic.soc
 `/etc/spark-attic/key`). A keyless status file, `/run/spark-attic/status.json`, tells dashboards what is lent
 ([STATUS-FILE.md](STATUS-FILE.md)).
 
-A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.6: it has never
+A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.7: it has never
 passed a node check (on 580.178.04 RM uses part of the region, so the check refuses list mode there), and atticd
 will not run in it until a driver validates it.
 
@@ -180,7 +180,7 @@ One command on the node, as root (INSTALL.md has the details, and the manual pat
 you, point the agent at [AGENTS.md](AGENTS.md): it has the install procedure and the rules an agent follows.
 
 ```
-curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.6/install.sh | sudo bash
+curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.7/install.sh | sudo bash
 ```
 
 The installer checks the node first (aarch64 GB10, root, systemd, the driver, a shim for that

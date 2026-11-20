@@ -111,8 +111,8 @@ mkartifact() { # $1 = artifact dir, $2 = version: what build-release.sh lays dow
   DOCI=$HERE/release/INSTALL.md
   [ -f "$DOCI" ] || DOCI=$HERE/INSTALL.md
   cp "$DOC" "$DOCI" "$HERE/STATUS-FILE.md" "$A/share/"
-  RELEASE_NOTES=$HERE/release/RELEASE-NOTES-0.1.6.md
-  [ -f "$RELEASE_NOTES" ] || RELEASE_NOTES=$HERE/RELEASE-NOTES-0.1.6.md
+  RELEASE_NOTES=$HERE/release/RELEASE-NOTES-0.1.7.md
+  [ -f "$RELEASE_NOTES" ] || RELEASE_NOTES=$HERE/RELEASE-NOTES-0.1.7.md
   cp "$RELEASE_NOTES" "$A/share/"
   cp "$HERE/LICENSE-MIT" "$HERE/LICENSE-APACHE" "$A/share/"
   printf 'third-party notices (test)\n' >"$A/share/THIRD_PARTY_NOTICES"
@@ -515,6 +515,45 @@ for f in usr/local/sbin/atticd usr/local/sbin/attic-check usr/local/bin/spark-at
 done
 ok $? "the interrupted install left nothing behind"
 unset ATTIC_FAKE_PAUSE ATTIC_FAKE_PAUSE_S
+unset_environ
+
+# ---------------------------------------------------------------- 7b2. a signal during validate keeps its reports
+# The same signal can land while validate runs, after attic-check wrote the modes it tried under
+# candidates/<driver>: the trap's rollback removes them with /var/lib/attic (finding 3), so the trap
+# copies them to failed-<stamp>/ first and says so. The fake systemctl's pause cannot show this: its
+# daemon-reload runs before validate. The artifact's own validate is replaced by a fake that writes
+# one FAILED report, pauses for the signal, and exits 1.
+echo "test_install: a signal during validate keeps its reports"
+AS=$T/sigval-art; mkartifact "$AS" 0.1.0
+cat >"$AS/scripts/attic-validate.sh" <<'EOF'
+#!/bin/bash
+# test fake: write one candidate report, pause for the signal, fail.
+drv=$(basename "$1")
+mkdir -p "$ATTIC_LIB/candidates/$drv" || exit 1
+printf '{"report": "interrupted-validate"}\n' >"$ATTIC_LIB/candidates/$drv/FAILED-heap.json" || exit 1
+if [ -n "${ATTIC_FAKE_VALIDATE_PAUSE:-}" ]; then
+  : >"$ATTIC_FAKE_VALIDATE_PAUSE"; sleep "${ATTIC_FAKE_VALIDATE_PAUSE_S:-3}"
+fi
+exit 1
+EOF
+chmod +x "$AS/scripts/attic-validate.sh"
+(cd "$AS" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum >SHA256SUMS)   # the artifact checksum gate must see the fake
+SV=$T/sigval; mknode "$SV"; instenv "$SV"
+export ATTIC_FAKE_VALIDATE_PAUSE="$SV/paused" ATTIC_FAKE_VALIDATE_PAUSE_S=3
+bash "$AS/install.sh" --from "$AS" --root "$SV" >"$SV/out" 2>&1 &
+pid=$!
+for i in $(seq 200); do [ -f "$SV/paused" ] && break; sleep 0.1; done
+kill -TERM "$pid" 2>/dev/null
+wait "$pid"; rc=$?
+[ $rc = 130 ] && grep -q "rolling back" "$SV/out" && grep -q "the candidate reports are kept in" "$SV/out"
+ok $? "a signal in validate: exit 130, rolled back, the message names the kept reports (rc $rc)"
+rep=$(ls -d "$SV"/var/log/spark-attic/failed-* 2>/dev/null | head -n1)
+[ -n "$rep" ] && [ -f "$rep/FAILED-heap.json" ] && [ "$(stat -c %a "$rep")" = 700 ] &&
+  [ ! -e "$SV/var/lib/attic" ]
+ok $? "the report outlives the rollback in $rep (0700) and /var/lib/attic was rolled back"
+[ ! -e "$SV/usr/local/sbin/atticd" ] && [ ! -e "$SV/etc/systemd/system/attic.service" ]
+ok $? "the interrupted validate left no installed files"
+unset ATTIC_FAKE_VALIDATE_PAUSE ATTIC_FAKE_VALIDATE_PAUSE_S
 unset_environ
 
 # ---------------------------------------------------------------- 7c. an upgrade while memory is lent
