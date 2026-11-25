@@ -65,6 +65,9 @@ agent follows. Run every step on the node itself, as root (`sudo`).
      loads by itself and logs one `spark-attic:` line. `SPARK_ATTIC_PLACE=off` turns it off for a comparison run.
    - **TensorFold:** no TensorFold release takes the carveout yet. It needs a build from the open pull request
      branch; INSTALL.md, section 6, has the settings.
+   - **gr8:** only gr8 `main` from kindlingai/gr8 #614 on reads atticd's key file; no gr8 release or published gr8
+     image has it yet. Set `GR8_DISPRAM=1 DISPRAM_SOCKET=/run/spark-attic/attic.sock
+     DISPRAM_KEY_FILE=/etc/spark-attic/key`. README.md, "gr8", has the details.
    - **Your own CUDA program:** `spark_attic.borrow()` (in `python/spark_attic`) maps memory into the calling
      process only. Another process cannot hand that memory to a running server.
 

@@ -22,7 +22,7 @@ from . import _cuda
 from ._cuda import CudaError
 from ._proto import DEFAULT_SOCK, SLICE, Attic, AtticError, Settings, key_ok
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 __all__ = ["Attic", "AtticError", "CudaError", "Lent", "Mapping", "Pool", "Settings", "borrow", "info", "SLICE",
            "DEFAULT_SOCK", "key_ok"]
 log = logging.getLogger("spark_attic")

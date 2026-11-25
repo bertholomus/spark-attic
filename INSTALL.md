@@ -72,8 +72,8 @@ else can put anything in front of these files.
 `scripts/attic-update.sh 580.178.04 <node>` builds the shim and the tools, stages them on the node and runs step 4
 there in one go (it needs ssh to the node and `sudo -n` there). It does not install anything: do step 3 once.
 
-`release/build-release.sh 0.1.7` makes the whole release artifact instead of a hand-staged
-folder: `spark-attic-0.1.7-aarch64.tar.gz` with atticd, attic-check, the driver shims for the
+`release/build-release.sh 0.1.8` makes the whole release artifact instead of a hand-staged
+folder: `spark-attic-0.1.8-aarch64.tar.gz` with atticd, attic-check, the driver shims for the
 compatibility list, the scripts, the Python package, the unit, the docs and SHA256SUMS — the
 tarball step 3 installs. The build is reproducible (two runs, one sha256). The node needs no
 compiler and no zig either way.
@@ -83,14 +83,14 @@ compiler and no zig either way.
 One command:
 
 ```
-curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.7/install.sh | sudo bash
+curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.8/install.sh | sudo bash
 ```
 
 or, for an offline copy of the release tarball (the curl form fetches and verifies the same
 tarball from the release URL):
 
 ```
-install.sh --from spark-attic-0.1.7-aarch64.tar.gz
+install.sh --from spark-attic-0.1.8-aarch64.tar.gz
 ```
 
 What it does, in order:
@@ -249,6 +249,11 @@ TF_CUDA_CARVEOUT_SOURCE=daemon TF_CUDA_CARVEOUT_SOCKET=/run/spark-attic/attic.so
 TF_CUDA_CARVEOUT_KEY_FILE=/etc/spark-attic/key TF_CUDA_CARVEOUT_MIB=2044` (the socket's default is another lender's,
 so name atticd's). It needs neither `nvidia_drm modeset=1` nor `/dev/dri`. Flash Next takes the carveout at one rank
 only. In a container, mount `/run/spark-attic` and the key as above.
+
+**gr8.** gr8 `main` from kindlingai/gr8 #614 on (not in a gr8 release or a published gr8 image yet, so build gr8
+from `main`) leases from atticd with `GR8_DISPRAM=1 DISPRAM_SOCKET=/run/spark-attic/attic.sock
+DISPRAM_KEY_FILE=/etc/spark-attic/key` (the socket's default is another lender's, so name atticd's). In a container,
+mount `/run/spark-attic` and the key as above. README.md, "gr8", has what each setting does.
 
 **Anything else.** `python/spark_attic` (`spark_attic.borrow()`) or the protocol in README.md.
 

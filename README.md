@@ -37,6 +37,8 @@ of lending nothing.
   the memory comes back when the process lets go or exits.
 - **Works with what you run.** A vLLM plugin and an SGLang hook (installed, not patched in), a pure-Python client,
   and a carveout source for TensorFold (open upstream as TensorFold #2762 and #2763, not in a TensorFold release yet).
+  KindlingAI's gr8 engine borrows from atticd natively (kindlingai/gr8 #614, in gr8 `main`, not in a gr8 release yet;
+  see "gr8" below).
 
 **One lender at a time.** Two lenders of the same carveout would fight over RM's heap, so the
 installer refuses to run while another one is listening. It checks the sockets named in
@@ -73,7 +75,7 @@ Clients speak one small protocol over a Unix socket (`/run/spark-attic/attic.soc
 `/etc/spark-attic/key`). A keyless status file, `/run/spark-attic/status.json`, tells dashboards what is lent
 ([STATUS-FILE.md](STATUS-FILE.md)).
 
-A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.7: it has never
+A second mode, **list**, lends the region's physical pages directly. It is not released in 0.1.8: it has never
 passed a node check (on 580.178.04 RM uses part of the region, so the check refuses list mode there), and atticd
 will not run in it until a driver validates it.
 
@@ -95,6 +97,7 @@ Placement errors detected while the plugin registers (a source that fits no shap
 refuses) turn the placement off with one log line instead: nothing was promised yet, so there is nothing to
 fail loudly about. |
 | Python | 3.9 or later, no dependencies (ctypes on `libcuda`); `torch` only for `.tensor()`. |
+| gr8 | gr8 `main` from commit `4c825327` (kindlingai/gr8 #614) on, which reads atticd's key file. Not in a gr8 release or a published gr8 image yet. Measured with atticd on two DGX Sparks (GB10) on 2026-11-25: see "gr8" below. |
 
 Where a plugin does not know the layout, it stays off and the engine runs exactly as without it, with one log line.
 
@@ -180,7 +183,7 @@ One command on the node, as root (INSTALL.md has the details, and the manual pat
 you, point the agent at [AGENTS.md](AGENTS.md): it has the install procedure and the rules an agent follows.
 
 ```
-curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.7/install.sh | sudo bash
+curl -fsSL https://github.com/bertholomus/spark-attic/releases/download/v0.1.8/install.sh | sudo bash
 ```
 
 The installer checks the node first (aarch64 GB10, root, systemd, the driver, a shim for that
@@ -235,6 +238,66 @@ x = m.tensor(torch.bfloat16)    # zero copy; or m.ptr and m.size
 
 The client fails open: no atticd, nothing free, or a failed CUDA step gives `None`, never an exception.
 
+## gr8
+
+[gr8](https://github.com/kindlingai/gr8), KindlingAI's inference engine, has its own client for the display carveout:
+with `GR8_DISPRAM=1` it "leases available 2 MiB physical granules [...] into GLM-5.3 and non-chunked GLM-5.3-Flash
+attention KV bindings via CUDA VMM, failing open to cudaMalloc when absent or exhausted" (gr8's `docs/ENV.md`). That
+client was written for Kindling Spark OS's dispramd. kindlingai/gr8 #614 adds a key file, so on stock DGX OS it leases
+from atticd instead. Three settings:
+
+```
+GR8_DISPRAM=1 DISPRAM_SOCKET=/run/spark-attic/attic.sock DISPRAM_KEY_FILE=/etc/spark-attic/key
+```
+
+| Setting | Meaning (from gr8's `docs/ENV.md`) |
+|---|---|
+| `GR8_DISPRAM` | `1` leases the carveout; `0` (the default) uses cudaMalloc only. With `GR8_DISPRAM_MIN_BYTES` above 0 a shortfall stops the boot and gr8's launcher falls back to its baseline KV size, instead of failing open. |
+| `DISPRAM_SOCKET` | The lender's socket. Its default, `/run/dispram/dispram.sock`, is dispramd's, so name atticd's. gr8 trusts the lender behind this path: the socket must be owned by root and writable only by root and the serving group (atticd's default is mode 0660). |
+| `DISPRAM_KEY_FILE` | The file whose text (surrounding whitespace trimmed, read at most 4 KiB) is the key every request carries. Unset, gr8 sends dispramd's own key. A file that cannot be read or holds no valid key leases nothing, after one line saying why. |
+
+A lease is held until gr8 frees its KV bindings or exits. gr8's launcher probes the lender with the same key before
+boot and passes `DISPRAM_SOCKET`, `DISPRAM_KEY_FILE` and `DISPRAM_DISABLE` to the engine; `DISPRAM_DISABLE=1` turns
+the probes and the leases off. In a container, mount `/run/spark-attic` and the key file, as for vLLM above; an engine
+that does not run as root needs the socket's group (INSTALL.md, section 6).
+
+**Which gr8.** #614 merged into gr8 `main` on 2026-11-24 (Pacific time; commit `4c825327`). It is not in a gr8
+release yet (the newest, v1.2.0, came out before it), and no published gr8 image carries it yet. Until a gr8
+release or image carries #614, build gr8 from `main`. An older gr8 has no `DISPRAM_KEY_FILE`, so it cannot
+lease from atticd.
+
+**What was tested.** The change's author tested gr8's client against atticd with the no-GPU fake RM shim: the free
+size reads back, 2 MiB and 4 MiB leases succeed, an over-ask and a wrong or missing key are refused, and a missing
+key file leases nothing. gr8's host tests cover the key file and a mock lender.
+
+**Measured on GB10.** On 2026-11-25, two DGX Sparks (GB10, stock DGX OS, driver 580.178.04, atticd 0.1.7 in heap
+mode) served GLM-5.3-Flash with tensor parallel 2 on gr8 `main` `77e82fef` (it contains #614), built through
+[KindlingAI's GLM-5.3-Flash recipe for two Sparks](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark) with its
+default settings (CAP 2,097,152 tokens, 4 sessions, int4 KV). Four boots, off, on, off, on; the only difference was
+`GR8_DISPRAM=0` or `1`, with `DISPRAM_SOCKET=/run/spark-attic/attic.sock DISPRAM_KEY_FILE=/etc/spark-attic/key`.
+
+| Per boot (Spark A / Spark B) | gr8 lease off (2 boots) | gr8 lease on (2 boots) |
+|---|---|---|
+| atticd while serving | lent 0 MiB, 0 clients | lent 2,044 MiB on each Spark, 1 client; all of it back at shutdown (lent 0, free 2,044) |
+| MemAvailable at ready | 10.01 / 10.32 GiB; 10.11 / 10.64 GiB | 12.07 / 12.75 GiB; 12.05 / 12.77 GiB |
+| gr8 KV pool | 2,097,152 tokens | 2,097,152 tokens |
+| 1 chat, 400 tokens, decode tok/s | 66.77; 66.89 | 66.75; 66.83 |
+| 4 chats, aggregate decode tok/s (2 runs a boot) | 82.68, 84.03; 82.74, 82.26 (mean 82.93) | 82.57, 82.43; 82.49, 81.34 (mean 82.21) |
+| gr8's smoke test | 14/14; 14/14 | 14/14; 14/14 |
+
+- **About 2 GiB more free memory on each Spark**, at the same KV pool. The recipe fixes CAP at 2,097,152 tokens, so
+  the pool does not grow: the lease moves 2,044 MiB of each rank's attention-KV bindings into the carveout, and that
+  shows as free memory. Whether a bigger CAP fits with the lease on was not tested.
+- **Speed:** 1 chat the same; 4 chats 0.9 % lower on the mean, while the lease-off runs alone span 82.26 to 84.03.
+- **Replies:** the 600-token chat and the 1-chat greedy replies are byte-identical in all four boots. In the 4-chat
+  batch, 2 of the 4 greedy replies come out in one of two wordings, and both wordings also appear with the lease off
+  (second off boot), so that is batch timing, not the lease.
+
+The [GLM-5.3 recipe for four DGX Sparks](https://github.com/bertholomus/glm-5.3-exlr8-4x-spark) (v3.2.1) runs gr8 with
+spark-attic through its own attic build of gr8, a different client with its own settings (`GR8_ATTIC_SOCK`,
+`GR8_ATTIC_KEY_FILE`), not #614's. Its README reports the KV pool with attic on vs off at the same settings (bit275,
+2026-11-11): 864,256 vs 765,952 tokens at CONC 1, 617,984 vs 544,256 at CONC 8.
+
 ## Driver updates
 
 ```
@@ -251,7 +314,7 @@ Run only one carveout lender on a node. `attic-validate.sh` refuses while anothe
 the other one first.
 
 atticd speaks the socket protocol of KindlingAI's dispramd, so clients written for dispramd work unchanged.
-Point them at atticd's socket and key.
+Point them at atticd's socket and key. gr8's client is one (see "gr8" above).
 
 ## Security
 
@@ -294,8 +357,13 @@ spark-attic stands on work that other people did first.
 - **Mia's AI Lab** ([MiaAI-Lab](https://github.com/MiaAI-Lab)) wrote the GLM-5.3-Flash and Qwen3.8 Flash Next
   recipes for TensorFold. The TensorFold run above uses the checkpoint and settings of the Qwen3.8 Flash Next recipe.
   MiaAI-Lab also wrote sparkDash, the dashboard that the status file is designed for.
+- **gr8** is KindlingAI's engine, built by the KindlingAI team: **Matt Mastracci**
+  ([mmastrac](https://github.com/mmastrac), @mmastrac on X) and **Chuck** ([chuck-ads](https://github.com/chuck-ads) /
+  [adapt-ai-systems](https://github.com/adapt-ai-systems), @ck2084 on X), the owners, with **Steve**
+  ([coffee-the-dev](https://github.com/coffee-the-dev), @coffeedev on X) and **Albert Lee**. The spark-attic support
+  in gr8 (kindlingai/gr8 #614) is that team's work, now in gr8 `main`.
 - **Kindling Spark OS** is by Matt Mastracci, with contributions from Chuck
-  ([adapt-ai-systems](https://github.com/adapt-ai-systems)) and [audreyt](https://github.com/audreyt). The
+  ([adapt-ai-systems](https://github.com/adapt-ai-systems), @ck2084 on X) and [audreyt](https://github.com/audreyt). The
   measurements with kernel 7.0.0-1019-nvidia-64k ran on Kindling Spark OS 0.9.5, with its own lender stopped.
 - **NVIDIA** publishes the open GPU kernel modules that the driver shim is built from.
 - The plugins use the public interfaces of **vLLM** and **SGLang**.
